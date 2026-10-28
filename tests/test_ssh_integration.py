@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -10,6 +11,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+
+import shiplord
 
 
 @unittest.skipUnless(os.environ.get("SHIPLORD_TEST_SSHD") == "1", "requires disposable Ubuntu sshd runner")
@@ -48,11 +51,23 @@ class SSHIntegrationTests(unittest.TestCase):
             f"  UserKnownHostsFile {cls.known_hosts}\n  GlobalKnownHostsFile /dev/null\n"
             f"  ControlMaster auto\n  ControlPersist 90\n  ControlPath {cls.root / 'control'}\n"
         )
+        payload = cls.root / "payload"
+        package = payload / "shiplord"
+        package.mkdir(mode=0o755, parents=True)
+        payload.chmod(0o755)
+        package.chmod(0o755)
+        source = Path(shiplord.__file__).parent
+        for name in ("__init__.py", "host.py", "framing.py", "protocol.py"):
+            shutil.copyfile(source / name, package / name)
+            (package / name).chmod(0o644)
+        launcher = cls.root / "launcher.py"
+        launcher.write_text(f'import sys\nsys.path.insert(0, "{payload}")\nfrom shiplord.host import main\nmain()\n')
+        launcher.chmod(0o644)
         dispatcher = cls.root / "dispatcher"
         dispatcher.write_text(
             '#!/bin/sh\ncase "$SSH_ORIGINAL_COMMAND" in\n'
             '  true) exec /usr/bin/true ;;\n'
-            f'  /usr/local/libexec/shiplord-dispatch) exec "{sys.executable}" -m shiplord.host ;;\n'
+            f'  /usr/local/libexec/shiplord-dispatch) exec /usr/bin/python3 -I -S -B "{launcher}" ;;\n'
             '  *) exit 1 ;;\nesac\n'
         )
         dispatcher.chmod(0o755)
