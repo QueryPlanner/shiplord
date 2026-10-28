@@ -6,9 +6,9 @@ the application manifest remains `ship.toml`.
 
 The CLI generates a project from a pinned template, creates and validates a
 local manifest, registers an already trusted SSH server, checks a few local
-prerequisites, and defines a provisional protocol envelope. Server bootstrap,
-deployment, and GitHub setup operations are not implemented. No server helper
-has been built or installed.
+prerequisites, and includes an unprivileged capabilities-only helper prototype.
+Server bootstrap, deployment, and GitHub setup operations are not implemented.
+No privileged server helper has been installed.
 
 ## Install
 

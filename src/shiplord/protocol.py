@@ -25,11 +25,18 @@ def decode_request(data: bytes) -> dict[str, Any]:
         message = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_keys, parse_constant=_invalid_constant)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise ProtocolError("invalid protocol JSON") from None
+    return validate_request(message)
+
+
+def validate_request(message: object, *, require_compatible: bool = True) -> dict[str, Any]:
+    """Validate the envelope; action arguments still require action-specific checks."""
     if not isinstance(message, dict):
         raise ProtocolError("protocol request must be an object")
     if set(message) != {"version", "request_id", "action", "application_id", "commit", "arguments"}:
         raise ProtocolError("protocol request has missing or unknown fields")
-    if type(message["version"]) is not int or message["version"] != PROTOCOL_VERSION:
+    if type(message["version"]) is not int or message["version"] < 1:
+        raise ProtocolError("invalid protocol version")
+    if require_compatible and message["version"] != PROTOCOL_VERSION:
         raise ProtocolError("incompatible protocol version")
     for field in ("request_id", "application_id"):
         value = message[field]
