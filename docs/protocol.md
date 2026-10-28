@@ -18,8 +18,8 @@ are defined and tested.
 
 The prototype accepts one request frame, followed by EOF on stdin. It rejects
 trailing bytes and emits one response frame, followed by EOF on stdout. The
-caller must close stdin after sending the request. The prototype itself does not
-enforce read or write deadlines; its caller must supply a finite timeout. It is
+caller must close stdin after sending the request. The prototype enforces a
+15-second overall deadline and its caller also supplies a finite timeout. It is
 not an installed dispatcher and must not be used as a privileged entry point.
 Server-scoped capability requests use `application_id: null`. Other actions
 require an application ID. A server-scoped response grants no application access.

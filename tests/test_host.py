@@ -66,3 +66,19 @@ class HostTests(unittest.TestCase):
             def write(self, data):
                 raise OSError("failed")
         self.assertEqual(serve(io.BytesIO(frame(request())), BrokenWriter()), 1)
+
+    def test_helper_closes_a_stalled_input_within_its_deadline(self):
+        with subprocess.Popen([sys.executable, "-m", "shiplord.host"], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            self.assertEqual(process.wait(timeout=20), 3)
+            self.assertIsNotNone(process.stdout)
+            self.assertEqual(read_frame(process.stdout), {"status": "error", "error": "timeout"})
+            self.assertEqual(process.stderr.read(), b"")
+
+    def test_timeout_handles_a_client_that_closed_its_read_pipe(self):
+        script = "import shiplord.host as host; host.DEADLINE_SECONDS = 0.1; host.main()"
+        with subprocess.Popen([sys.executable, "-c", script], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            process.stdout.close()
+            self.assertEqual(process.wait(timeout=3), 3)
+            self.assertEqual(process.stderr.read(), b"")

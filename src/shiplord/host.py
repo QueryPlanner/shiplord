@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import os
+import signal
 import sys
 from typing import BinaryIO
 
 from . import __version__
 from .framing import read_frame, write_frame
 from .protocol import PROTOCOL_VERSION, ProtocolError, validate_request
+
+DEADLINE_SECONDS = 15
+
+
+class HostDeadline(Exception):
+    """The prototype request exceeded its overall deadline."""
+
+
+def _deadline_expired(_signum: int, _frame: object) -> None:
+    raise HostDeadline()
 
 
 def serve(source: BinaryIO, destination: BinaryIO) -> int:
@@ -43,7 +55,25 @@ def serve(source: BinaryIO, destination: BinaryIO) -> int:
 
 
 def main() -> None:
-    raise SystemExit(serve(sys.stdin.buffer, sys.stdout.buffer))
+    signal.signal(signal.SIGALRM, _deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, DEADLINE_SECONDS)
+    try:
+        code = serve(sys.stdin.buffer, sys.stdout.buffer)
+    except HostDeadline:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        try:
+            os.set_blocking(sys.stdout.fileno(), False)
+            write_frame(sys.stdout.buffer, {"status": "error", "error": "timeout"})
+            sys.stdout.buffer.flush()
+        except (ProtocolError, OSError):
+            try:
+                sys.stdout.close()
+            except OSError:
+                pass
+        code = 3
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    raise SystemExit(code)
 
 
 if __name__ == "__main__":

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
-import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -51,23 +52,29 @@ class SSHIntegrationTests(unittest.TestCase):
             f"  UserKnownHostsFile {cls.known_hosts}\n  GlobalKnownHostsFile /dev/null\n"
             f"  ControlMaster auto\n  ControlPersist 90\n  ControlPath {cls.root / 'control'}\n"
         )
-        payload = cls.root / "payload"
+        payload = Path("/usr/local/lib") / f"shiplord-ci-{os.getpid()}"
+        if os.path.lexists(payload):
+            raise RuntimeError("Disposable helper installation path already exists")
+        subprocess.run(["sudo", "-n", "install", "-d", "-m", "0755", str(payload / "shiplord")], check=True)
+        cls.payload = payload
+        cls.addClassCleanup(cls._remove_payload)
         package = payload / "shiplord"
-        package.mkdir(mode=0o755, parents=True)
-        payload.chmod(0o755)
-        package.chmod(0o755)
         source = Path(shiplord.__file__).parent
         for name in ("__init__.py", "host.py", "framing.py", "protocol.py"):
-            shutil.copyfile(source / name, package / name)
-            (package / name).chmod(0o644)
+            subprocess.run(["sudo", "-n", "install", "-m", "0644", str(source / name), str(package / name)], check=True)
         launcher = cls.root / "launcher.py"
         launcher.write_text(f'import sys\nsys.path.insert(0, "{payload}")\nfrom shiplord.host import main\nmain()\n')
-        launcher.chmod(0o644)
+        installed_launcher = payload / "launcher.py"
+        subprocess.run(["sudo", "-n", "install", "-m", "0644", str(launcher), str(installed_launcher)], check=True)
+        prototype = cls.root / "prototype"
+        prototype.write_text(f'#!/bin/sh\nexec /usr/bin/python3 -I -S -B "{installed_launcher}"\n')
+        cls.prototype = payload / "dispatcher"
+        subprocess.run(["sudo", "-n", "install", "-m", "0755", str(prototype), str(cls.prototype)], check=True)
         dispatcher = cls.root / "dispatcher"
         dispatcher.write_text(
             '#!/bin/sh\ncase "$SSH_ORIGINAL_COMMAND" in\n'
             '  true) exec /usr/bin/true ;;\n'
-            f'  /usr/local/libexec/shiplord-dispatch) exec /usr/bin/python3 -I -S -B "{launcher}" ;;\n'
+            f'  /usr/local/libexec/shiplord-dispatch) exec "{cls.prototype}" ;;\n'
             '  *) exit 1 ;;\nesac\n'
         )
         dispatcher.chmod(0o755)
@@ -124,6 +131,11 @@ class SSHIntegrationTests(unittest.TestCase):
         subprocess.run(["sudo", "-n", "userdel", cls.username], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    @classmethod
+    def _remove_payload(cls):
+        subprocess.run(["sudo", "-n", "rm", "-rf", "--", str(cls.payload)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     def run_cli(self, alias):
         return subprocess.run([self.executable, "server", "add", alias, "--ssh", self.target],
                               env=self.env, capture_output=True, text=True, timeout=20, check=False)
@@ -136,7 +148,61 @@ class SSHIntegrationTests(unittest.TestCase):
     def assert_not_saved(self, alias):
         self.assertFalse((self.root / "config/shiplord/servers" / f"{alias}.json").exists())
 
+    def test_installed_prototype_ignores_untrusted_python_environment(self):
+        hostile = self.root / "hostile"
+        hostile.mkdir(mode=0o777)
+        hostile.chmod(0o777)
+        module = hostile / "shiplord"
+        module.mkdir(mode=0o755)
+        marker = hostile / "injected"
+        (module / "__init__.py").write_text(f'open("{marker}", "w").write("executed")\n')
+        request = {"version": 1, "request_id": "fixture-1", "action": "capabilities",
+                   "application_id": None, "commit": None, "arguments": {}}
+        body = json.dumps(request).encode()
+        result = subprocess.run(["sudo", "-n", "-u", self.username, "/usr/bin/env",
+                                 f"PYTHONPATH={hostile}", f"PYTHONHOME={hostile}", str(self.prototype)],
+                                input=len(body).to_bytes(4, "big") + body, cwd=hostile,
+                                capture_output=True, timeout=20, check=False)
+        self.assertEqual(result.returncode, 0)
+        size = int.from_bytes(result.stdout[:4], "big")
+        self.assertEqual(len(result.stdout), 4 + size)
+        self.assertEqual(json.loads(result.stdout[4:])["actions"], ["capabilities"])
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.payload / "shiplord/__pycache__").exists())
+
+    def test_installed_prototype_rejects_invalid_and_mutating_requests(self):
+        base = {"version": 1, "request_id": "fixture-1", "action": "capabilities",
+                "application_id": "orders", "commit": None, "arguments": {}}
+        for changes, suffix, status, error in [
+            ({"action": "deploy"}, b"", 1, "unsupported_action"),
+            ({"version": 2}, b"", 4, None),
+            ({}, b"extra", 2, "invalid_request"),
+        ]:
+            with self.subTest(changes=changes, suffix=suffix):
+                body = json.dumps(dict(base, **changes)).encode()
+                result = subprocess.run(["sudo", "-n", "-u", self.username, str(self.prototype)],
+                                        input=len(body).to_bytes(4, "big") + body + suffix,
+                                        capture_output=True, timeout=20, check=False)
+                self.assertEqual(result.returncode, status)
+                size = int.from_bytes(result.stdout[:4], "big")
+                self.assertEqual(len(result.stdout), 4 + size)
+                response = json.loads(result.stdout[4:])
+                if error:
+                    self.assertEqual(response["error"], error)
+                else:
+                    self.assertEqual(response["supported_versions"], [1])
+
     def test_verified_host_keys_authentication_and_control_master(self):
+        for path in (Path("/usr"), Path("/usr/local"), Path("/usr/local/lib"), self.payload,
+                     self.payload / "shiplord", self.prototype, self.payload / "launcher.py",
+                     *(self.payload / "shiplord").iterdir()):
+            with self.subTest(path=str(path)):
+                self.assertFalse(path.is_symlink())
+                details = path.stat()
+                self.assertEqual(details.st_uid, 0)
+                self.assertEqual(stat.S_IMODE(details.st_mode) & 0o022, 0)
+                writable = subprocess.run(["sudo", "-n", "-u", self.username, "test", "-w", str(path)], check=False)
+                self.assertNotEqual(writable.returncode, 0)
         self.assertEqual(self.run_cli("baseline").returncode, 0)
         doctor = subprocess.run([self.executable, "doctor", "--server", "baseline", "--json"],
                                 env=self.env, capture_output=True, text=True, timeout=20, check=False)
