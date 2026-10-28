@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from shiplord.configure import ConfigurationError, create_manifest
 from shiplord.manifest import ManifestError, load_manifest
 
 MANIFEST = '''schema_version = 1
@@ -84,6 +85,11 @@ class ManifestTests(unittest.TestCase):
             self.load('name = "secretvalue')
         self.assertNotIn("secretvalue", str(caught.exception))
 
+    def test_configuration_reports_unusable_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ConfigurationError, "could not create ship.toml"):
+                create_manifest(Path(directory) / "missing", "orders", "production", "api.example.com", [])
+
 
 class CLITests(unittest.TestCase):
     def invoke(self, directory: str, *args: str, env=None):
@@ -120,7 +126,6 @@ class CLITests(unittest.TestCase):
             ["server", "add", "production", "--ssh", "appuser@example.com"],
             ["server", "bootstrap", "production"],
             ["init", "orders", "--template", "google-adk"],
-            ["configure", "--server", "production", "--api-domain", "example.com"],
             ["provision"], ["status", "--json"], ["logs", "--tail", "10"],
             ["rollback", "--json"], ["recover", "--json"],
             ["github", "setup", "--repo", "QueryPlanner/orders"],
@@ -140,6 +145,51 @@ class CLITests(unittest.TestCase):
             result = self.invoke(directory, "doctor", "--local", "--server", "production", "--json")
         self.assertEqual(result.returncode, 2)
         self.assertFalse(json.loads(result.stdout)["ok"])
+
+    def test_configure_creates_a_valid_manifest_without_github_settings(self):
+        with tempfile.TemporaryDirectory() as parent:
+            directory = Path(parent) / "orders"
+            directory.mkdir()
+            result = self.invoke(str(directory), "configure", "--server", "production", "--api-domain", "api.example.com", "--frontend", "https://example.com")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = load_manifest(directory / "ship.toml")
+            self.assertEqual(config["name"], "orders")
+            self.assertEqual(config["http"]["frontend_origins"], ["https://example.com"])
+            self.assertNotIn("github", config)
+            self.assertIn("has not been checked", result.stdout)
+
+    def test_configure_supports_an_explicit_empty_frontend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production", "--api-domain", "api.example.com", "--no-frontend")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(load_manifest(Path(directory) / "ship.toml")["http"]["frontend_origins"], [])
+
+    def test_configure_refuses_ambiguous_or_invalid_inputs(self):
+        cases = [[], ["--frontend", "https://example.com", "--no-frontend"], ["--frontend", "https://example.com/path"]]
+        with tempfile.TemporaryDirectory() as directory:
+            for options in cases:
+                with self.subTest(options=options):
+                    result = self.invoke(directory, "configure", "--name", "orders", "--server", "production", "--api-domain", "api.example.com", *options)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertFalse((Path(directory) / "ship.toml").exists())
+
+    def test_configure_never_replaces_an_existing_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "ship.toml"
+            manifest.write_text("existing user data")
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production", "--api-domain", "api.example.com", "--no-frontend")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(manifest.read_text(), "existing user data")
+            self.assertEqual([p.name for p in Path(directory).iterdir()], ["ship.toml"])
+
+    def test_configure_does_not_follow_manifest_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "user-data"
+            target.write_text("keep this")
+            (Path(directory) / "ship.toml").symlink_to(target)
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production", "--api-domain", "api.example.com", "--no-frontend")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(target.read_text(), "keep this")
 
     def test_doctor_local_reports_only_local_checks(self):
         with tempfile.TemporaryDirectory() as directory:

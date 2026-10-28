@@ -82,6 +82,12 @@ def load_manifest(path: Path = Path("ship.toml")) -> dict:
     except (OSError, tomllib.TOMLDecodeError):
         raise ManifestError("ship.toml could not be read as valid TOML") from None
 
+    return validate_manifest(raw)
+
+
+def validate_manifest(raw: dict) -> dict:
+    """Validate parsed manifest data and return its nonsecret configuration."""
+
     root = _table(raw, "manifest", {"schema_version", "name", "server", "template", "runtime", "http", "resources", "deploy", "github"})
     if type(root.get("schema_version")) is not int or root["schema_version"] != 1:
         raise ManifestError("schema_version must be 1")
@@ -116,14 +122,16 @@ def load_manifest(path: Path = Path("ship.toml")) -> dict:
     deploy = _table(root.get("deploy"), "deploy", {"readiness_timeout_seconds", "retain_successful_releases"})
     timeout = _integer(deploy.get("readiness_timeout_seconds"), "deploy.readiness_timeout_seconds", 1, 3600)
     retain = _integer(deploy.get("retain_successful_releases"), "deploy.retain_successful_releases", 2, 100)
-    github = _table(root.get("github"), "github", {"repository", "deployment_branch"})
-    repository = _string(github.get("repository"), "github.repository")
-    if not _REPOSITORY.fullmatch(repository) or any(part in {".", ".."} or part.startswith("-") for part in repository.split("/")):
-        raise ManifestError("github.repository must be an owner/repository pair")
-    branch = _string(github.get("deployment_branch"), "github.deployment_branch")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) or any(x in branch for x in ("..", "//", "@{")) or branch.endswith(("/", ".", ".lock")) or any(part.startswith(".") for part in branch.split("/")):
-        raise ManifestError("github.deployment_branch must be a valid branch name")
-    return {"schema_version": 1, "name": name, "server": server, "template": template, "runtime": runtime,
+    result = {"schema_version": 1, "name": name, "server": server, "template": template, "runtime": runtime,
             "http": {"api_domain": domain, "frontend_origins": validated_origins, "container_port": port, "readiness_path": readiness},
-            "resources": {"memory_mb": memory}, "deploy": {"readiness_timeout_seconds": timeout, "retain_successful_releases": retain},
-            "github": {"repository": repository, "deployment_branch": branch}}
+            "resources": {"memory_mb": memory}, "deploy": {"readiness_timeout_seconds": timeout, "retain_successful_releases": retain}}
+    if "github" in root:
+        github = _table(root["github"], "github", {"repository", "deployment_branch"})
+        repository = _string(github.get("repository"), "github.repository")
+        if not _REPOSITORY.fullmatch(repository) or any(part in {".", ".."} or part.startswith("-") for part in repository.split("/")):
+            raise ManifestError("github.repository must be an owner/repository pair")
+        branch = _string(github.get("deployment_branch"), "github.deployment_branch")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) or any(x in branch for x in ("..", "//", "@{")) or branch.endswith(("/", ".", ".lock")) or any(part.startswith(".") for part in branch.split("/")):
+            raise ManifestError("github.deployment_branch must be a valid branch name")
+        result["github"] = {"repository": repository, "deployment_branch": branch}
+    return result

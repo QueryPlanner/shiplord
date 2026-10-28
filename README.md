@@ -4,10 +4,10 @@ Shiplord is an early-stage CLI for managing application deployments. The design
 is in [ship-cli-plan.md](ship-cli-plan.md). The executable is named `shiplord`;
 the application manifest remains `ship.toml`.
 
-This first milestone validates a local manifest, previews its configuration,
+The CLI creates and validates a local manifest, previews its configuration,
 checks a few local prerequisites, and defines a provisional protocol envelope.
-All server, deployment, template generation, and GitHub setup operations report
-that they are not implemented. No server helper has been built or installed.
+Server, deployment, template generation, and GitHub setup operations report that
+they are not implemented. No server helper has been built or installed.
 
 ## Install
 
@@ -20,7 +20,19 @@ shiplord --help
 
 ## Local preview
 
-Create `ship.toml` in the application directory. This example contains no secrets:
+Create a manifest in the application directory:
+
+```sh
+shiplord configure --name orders --server production \
+  --api-domain orders-api.example.com --frontend https://orders.example.com
+```
+
+Repeat `--frontend` for multiple origins, or use `--no-frontend` for an explicit
+empty list. The command refuses to replace an existing `ship.toml`. It does not
+verify the server alias. `--name` defaults to the current directory name.
+
+The manifest contains no secrets. A GitHub section can be added once the
+repository is known. For example:
 
 ```toml
 schema_version = 1

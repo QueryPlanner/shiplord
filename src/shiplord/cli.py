@@ -10,6 +10,7 @@ from typing import Optional
 import typer
 
 from . import __version__
+from .configure import ConfigurationError, create_manifest
 from .manifest import ManifestError, load_manifest
 
 app = typer.Typer(no_args_is_help=True, help="Manage application releases. Remote operations are not implemented yet.")
@@ -90,8 +91,20 @@ def init(name: str, template: str = typer.Option(..., "--template")) -> None:
 
 @app.command()
 def configure(server: str = typer.Option(..., "--server"), api_domain: str = typer.Option(..., "--api-domain"),
-              frontend: Optional[list[str]] = typer.Option(None, "--frontend")) -> None:
-    _unavailable("configure")
+              frontend: Optional[list[str]] = typer.Option(None, "--frontend"),
+              no_frontend: bool = typer.Option(False, "--no-frontend"),
+              name: Optional[str] = typer.Option(None, "--name"),
+              runtime: str = typer.Option("docker", "--runtime")) -> None:
+    """Create ship.toml in the current directory without overwriting it."""
+    if bool(frontend) == no_frontend:
+        typer.echo("error: specify --frontend or explicitly choose --no-frontend", err=True)
+        raise typer.Exit(2)
+    try:
+        create_manifest(Path.cwd(), name or Path.cwd().name, server, api_domain, frontend or [], runtime)
+    except (ConfigurationError, ManifestError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from None
+    typer.echo("Created ship.toml. The server alias has not been checked.")
 
 
 @app.command()
