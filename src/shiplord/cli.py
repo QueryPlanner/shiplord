@@ -12,6 +12,7 @@ import typer
 from . import __version__
 from .configure import ConfigurationError, create_manifest
 from .manifest import ManifestError, load_manifest
+from .servers import InvalidTarget, ServerError, SSHCheckError, register_server
 from .template import TemplateError, create_project
 
 app = typer.Typer(no_args_is_help=True, help="Manage application releases. Remote operations are not implemented yet.")
@@ -77,7 +78,14 @@ def doctor(local: bool = typer.Option(False, "--local", help="Check local prereq
 
 @server_app.command("add")
 def server_add(alias: str, ssh: str = typer.Option(..., "--ssh")) -> None:
-    _unavailable("server add")
+    """Register a server using an already trusted OpenSSH login."""
+    try:
+        register_server(alias, ssh)
+    except (ManifestError, ServerError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        code = 2 if isinstance(exc, (ManifestError, InvalidTarget)) else 3 if isinstance(exc, SSHCheckError) else 1
+        raise typer.Exit(code) from None
+    typer.echo("Server alias saved. Bootstrap and CI host-key setup are not implemented.")
 
 
 @server_app.command("bootstrap")

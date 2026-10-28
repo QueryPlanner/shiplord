@@ -5,9 +5,10 @@ is in [ship-cli-plan.md](ship-cli-plan.md). The executable is named `shiplord`;
 the application manifest remains `ship.toml`.
 
 The CLI generates a project from a pinned template, creates and validates a
-local manifest, checks a few local prerequisites, and defines a provisional
-protocol envelope. Server, deployment, and GitHub setup operations report that
-they are not implemented. No server helper has been built or installed.
+local manifest, registers an already trusted SSH server, checks a few local
+prerequisites, and defines a provisional protocol envelope. Server bootstrap,
+deployment, and GitHub setup operations are not implemented. No server helper
+has been built or installed.
 
 ## Install
 
@@ -19,6 +20,21 @@ shiplord --help
 ```
 
 ## Local preview
+
+To register an existing trusted SSH login:
+
+```sh
+shiplord server add production --ssh appuser@server-alias
+```
+
+The command uses your OpenSSH configuration and checks host trust without
+prompting. It requires a trusted host key and an unlocked identity. Configure
+nondefault ports in OpenSSH. If the check fails, verify the host key through a
+trusted channel and unlock the key using your normal SSH setup. Shiplord does
+not accept or update host keys automatically. This check does not verify sudo
+access or server readiness. CI host-key recording is not implemented yet.
+Server aliases are stored in the user-owned `shiplord/servers` directory under
+`XDG_CONFIG_HOME`, or under `~/.config` when that variable is unset.
 
 Generate a project and create a manifest in its directory:
 

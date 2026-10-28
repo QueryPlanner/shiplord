@@ -123,7 +123,6 @@ class CLITests(unittest.TestCase):
 
     def test_other_remote_commands_fail_without_writing_files(self):
         commands = [
-            ["server", "add", "production", "--ssh", "appuser@example.com"],
             ["server", "bootstrap", "production"],
             ["provision"], ["status", "--json"], ["logs", "--tail", "10"],
             ["rollback", "--json"], ["recover", "--json"],
