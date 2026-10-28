@@ -12,6 +12,7 @@ import typer
 from . import __version__
 from .configure import ConfigurationError, create_manifest
 from .manifest import ManifestError, load_manifest
+from .template import TemplateError, create_project
 
 app = typer.Typer(no_args_is_help=True, help="Manage application releases. Remote operations are not implemented yet.")
 server_app = typer.Typer(no_args_is_help=True, help="Manage servers (not implemented yet).")
@@ -86,7 +87,13 @@ def server_bootstrap(alias: str) -> None:
 
 @app.command("init")
 def init(name: str, template: str = typer.Option(..., "--template")) -> None:
-    _unavailable("init")
+    """Create an application from the pinned template snapshot."""
+    try:
+        create_project(Path.cwd(), name, template)
+    except (ManifestError, TemplateError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1 if isinstance(exc, TemplateError) else 2) from None
+    typer.echo(f"Created {name} from the pinned google-adk template.")
 
 
 @app.command()

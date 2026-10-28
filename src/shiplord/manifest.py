@@ -38,6 +38,14 @@ def _integer(value: object, name: str, minimum: int, maximum: int) -> int:
     return value
 
 
+def validate_app_name(value: object) -> str:
+    """Validate an application name before using it as a path component."""
+    name = _string(value, "name")
+    if len(name) > 48 or not _NAME.fullmatch(name):
+        raise ManifestError("name must be a lowercase application name")
+    return name
+
+
 def _hostname(value: object, name: str) -> str:
     host = _string(value, name)
     if len(host) > 253 or host != host.lower() or host.endswith("."):
@@ -91,9 +99,7 @@ def validate_manifest(raw: dict) -> dict:
     root = _table(raw, "manifest", {"schema_version", "name", "server", "template", "runtime", "http", "resources", "deploy", "github"})
     if type(root.get("schema_version")) is not int or root["schema_version"] != 1:
         raise ManifestError("schema_version must be 1")
-    name = _string(root.get("name"), "name")
-    if len(name) > 48 or not _NAME.fullmatch(name):
-        raise ManifestError("name must be a lowercase application name")
+    name = validate_app_name(root.get("name"))
     server = _string(root.get("server"), "server")
     if len(server) > 48 or not _NAME.fullmatch(server):
         raise ManifestError("server must be a lowercase server alias")

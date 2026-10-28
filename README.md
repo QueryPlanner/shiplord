@@ -4,9 +4,9 @@ Shiplord is an early-stage CLI for managing application deployments. The design
 is in [ship-cli-plan.md](ship-cli-plan.md). The executable is named `shiplord`;
 the application manifest remains `ship.toml`.
 
-The CLI creates and validates a local manifest, previews its configuration,
-checks a few local prerequisites, and defines a provisional protocol envelope.
-Server, deployment, template generation, and GitHub setup operations report that
+The CLI generates a project from a pinned template, creates and validates a
+local manifest, checks a few local prerequisites, and defines a provisional
+protocol envelope. Server, deployment, and GitHub setup operations report that
 they are not implemented. No server helper has been built or installed.
 
 ## Install
@@ -20,9 +20,11 @@ shiplord --help
 
 ## Local preview
 
-Create a manifest in the application directory:
+Generate a project and create a manifest in its directory:
 
 ```sh
+shiplord init orders --template google-adk
+cd orders
 shiplord configure --name orders --server production \
   --api-domain orders-api.example.com --frontend https://orders.example.com
 ```
@@ -30,6 +32,15 @@ shiplord configure --name orders --server production \
 Repeat `--frontend` for multiple origins, or use `--no-frontend` for an explicit
 empty list. The command refuses to replace an existing `ship.toml`. It does not
 verify the server alias. `--name` defaults to the current directory name.
+
+Initialization fetches the public template at commit
+`f6c277605742187312a100de8d3ad6c8ac4eea0f` over HTTPS from GitHub. It records
+the commit in `.shiplord-template.json`. GitHub's archive endpoint and TLS are
+the trust source; Shiplord does not independently verify Git objects. The
+template's Python package remains named `agent`. GitHub repository customization
+and deployment workflow integration are not implemented yet. Initialization
+refuses nonempty directories and does not overwrite files. If publishing files
+to the target fails, the error reports that the target may contain partial files.
 
 The manifest contains no secrets. A GitHub section can be added once the
 repository is known. For example:

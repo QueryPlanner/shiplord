@@ -125,7 +125,6 @@ class CLITests(unittest.TestCase):
         commands = [
             ["server", "add", "production", "--ssh", "appuser@example.com"],
             ["server", "bootstrap", "production"],
-            ["init", "orders", "--template", "google-adk"],
             ["provision"], ["status", "--json"], ["logs", "--tail", "10"],
             ["rollback", "--json"], ["recover", "--json"],
             ["github", "setup", "--repo", "QueryPlanner/orders"],
