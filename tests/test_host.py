@@ -34,7 +34,7 @@ class HostTests(unittest.TestCase):
         return result.returncode, response
 
     def test_capabilities_reports_only_the_unprivileged_action(self):
-        code, response = self.run_helper(frame(request()))
+        code, response = self.run_helper(frame(request(application_id=None)))
         self.assertEqual(code, 0)
         check_capabilities(response, "job-1", "capabilities")
         self.assertEqual(response["actions"], ["capabilities"])

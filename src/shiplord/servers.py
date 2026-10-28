@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 
 from .manifest import validate_app_name
+from .protocol import _invalid_constant, _unique_keys
 
 
 class ServerError(ValueError):
@@ -50,19 +51,21 @@ def _config_home() -> Path:
     return path
 
 
-def _private_servers_directory() -> int:
+def _private_servers_directory(*, create: bool = True) -> int:
     """Open the private server directory; the caller owns the returned fd."""
     base = _config_home()
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
-        base.mkdir(parents=True, exist_ok=True)
+        if create:
+            base.mkdir(parents=True, exist_ok=True)
         current = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
         try:
             for name in ("shiplord", "servers"):
-                try:
-                    os.mkdir(name, 0o700, dir_fd=current)
-                except FileExistsError:
-                    pass
+                if create:
+                    try:
+                        os.mkdir(name, 0o700, dir_fd=current)
+                    except FileExistsError:
+                        pass
                 child = os.open(name, flags, dir_fd=current)
                 os.close(current)
                 current = child
@@ -75,6 +78,32 @@ def _private_servers_directory() -> int:
             raise
     except OSError:
         raise ServerError("could not access the private server configuration directory") from None
+
+
+def load_server(alias: str) -> str:
+    """Read a previously registered alias without creating local state."""
+    alias = validate_app_name(alias)
+    directory = _private_servers_directory(create=False)
+    try:
+        descriptor = os.open(alias + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(descriptor, "rb") as file:
+            details = os.fstat(file.fileno())
+            if (not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid()
+                    or stat.S_IMODE(details.st_mode) & 0o077 or details.st_size > 4096):
+                raise ServerError("server alias file is not a private regular file")
+            data = file.read(4097)
+        if len(data) > 4096:
+            raise ServerError("server alias file is too large")
+        record = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_keys, parse_constant=_invalid_constant)
+        if (not isinstance(record, dict) or set(record) != {"schema_version", "alias", "ssh"}
+                or type(record["schema_version"]) is not int or record["schema_version"] != 1
+                or record["alias"] != alias):
+            raise ServerError("server alias file is invalid")
+        return validate_target(record["ssh"])
+    except (OSError, UnicodeDecodeError, ValueError):
+        raise ServerError("could not read a valid private server alias") from None
+    finally:
+        os.close(directory)
 
 
 def _save_server(alias: str, target: str) -> None:
@@ -103,8 +132,8 @@ def _save_server(alias: str, target: str) -> None:
             os.close(directory)
 
 
-def register_server(alias: str, target: str) -> None:
-    alias = validate_app_name(alias)
+def ssh_command(target: str, remote_command: str) -> list[str]:
+    """Build a fresh, host-key-checked SSH invocation from a validated target."""
     target = validate_target(target)
     options = [
         "BatchMode=yes", "StrictHostKeyChecking=yes", "VerifyHostKeyDNS=no",
@@ -115,7 +144,14 @@ def register_server(alias: str, target: str) -> None:
     command = ["ssh"]
     for option in options:
         command.extend(["-o", option])
-    command.extend(["--", target, "true"])
+    command.extend(["--", target, remote_command])
+    return command
+
+
+def register_server(alias: str, target: str) -> None:
+    alias = validate_app_name(alias)
+    target = validate_target(target)
+    command = ssh_command(target, "true")
     try:
         result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, timeout=15, check=False)

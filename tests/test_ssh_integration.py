@@ -48,11 +48,20 @@ class SSHIntegrationTests(unittest.TestCase):
             f"  UserKnownHostsFile {cls.known_hosts}\n  GlobalKnownHostsFile /dev/null\n"
             f"  ControlMaster auto\n  ControlPersist 90\n  ControlPath {cls.root / 'control'}\n"
         )
+        dispatcher = cls.root / "dispatcher"
+        dispatcher.write_text(
+            '#!/bin/sh\ncase "$SSH_ORIGINAL_COMMAND" in\n'
+            '  true) exec /usr/bin/true ;;\n'
+            f'  /usr/local/libexec/shiplord-dispatch) exec "{sys.executable}" -m shiplord.host ;;\n'
+            '  *) exit 1 ;;\nesac\n'
+        )
+        dispatcher.chmod(0o755)
         daemon_config = cls.root / "sshd_config"
         daemon_config.write_text(
             f"Port {cls.port}\nListenAddress 127.0.0.1\nHostKey {cls.root / 'host'}\n"
             f"PidFile {cls.root / 'sshd.pid'}\nAuthorizedKeysFile {cls.authorized}\n"
             f"AllowUsers {cls.username}\nStrictModes no\nUsePAM no\nPubkeyAuthentication yes\n"
+            f"ForceCommand {dispatcher}\n"
             "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n"
             "PermitUserEnvironment no\nLogLevel ERROR\n"
         )
@@ -114,6 +123,10 @@ class SSHIntegrationTests(unittest.TestCase):
 
     def test_verified_host_keys_authentication_and_control_master(self):
         self.assertEqual(self.run_cli("baseline").returncode, 0)
+        doctor = subprocess.run([self.executable, "doctor", "--server", "baseline", "--json"],
+                                env=self.env, capture_output=True, text=True, timeout=20, check=False)
+        self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+        self.assertIn("protocol capabilities only", doctor.stdout)
         self.known_hosts.write_text("")
         self.assertEqual(self.run_cli("unknown").returncode, 3)
         self.assert_not_saved("unknown")

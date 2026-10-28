@@ -7,7 +7,7 @@ import re
 import struct
 from typing import BinaryIO
 
-from .protocol import MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProtocolError, _IDENTIFIER, _invalid_constant, _unique_keys
+from .protocol import IncompatibleProtocol, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, ProtocolError, _IDENTIFIER, _invalid_constant, _unique_keys
 
 
 def _read_exact(stream: BinaryIO, size: int) -> bytes:
@@ -73,11 +73,11 @@ def check_capabilities(response: dict, request_id: str, action: str) -> None:
                 or any(type(version) is not int or version < 1 for version in versions)
                 or len(set(versions)) != len(versions)):
             raise ProtocolError("invalid incompatibility response")
-        raise ProtocolError("incompatible protocol version")
+        raise IncompatibleProtocol("incompatible protocol version")
     if set(response) != {"status", "request_id", "version", "helper_version", "actions"} or response.get("status") != "ok":
         raise ProtocolError("invalid capability response")
     if type(response["version"]) is not int or response["version"] != PROTOCOL_VERSION:
-        raise ProtocolError("incompatible protocol version")
+        raise IncompatibleProtocol("incompatible protocol version")
     helper_version = response["helper_version"]
     actions = response["actions"]
     if (not isinstance(helper_version, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}", helper_version)

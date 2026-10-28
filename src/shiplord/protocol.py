@@ -17,6 +17,10 @@ class ProtocolError(ValueError):
     """A protocol message is malformed or incompatible."""
 
 
+class IncompatibleProtocol(ProtocolError):
+    """The peer does not support this protocol version."""
+
+
 def decode_request(data: bytes) -> dict[str, Any]:
     """Decode an envelope, without treating action arguments as authorized input."""
     if len(data) > MAX_MESSAGE_BYTES:
@@ -40,6 +44,8 @@ def validate_request(message: object, *, require_compatible: bool = True) -> dic
         raise ProtocolError("incompatible protocol version")
     for field in ("request_id", "application_id"):
         value = message[field]
+        if field == "application_id" and value is None and message.get("action") == "capabilities":
+            continue
         if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
             raise ProtocolError(f"invalid {field}")
     if not isinstance(message["action"], str) or message["action"] not in _ACTIONS:

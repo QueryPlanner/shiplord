@@ -128,7 +128,6 @@ class CLITests(unittest.TestCase):
             ["rollback", "--json"], ["recover", "--json"],
             ["github", "setup", "--repo", "QueryPlanner/orders"],
             ["github", "status", "--json"], ["github", "rotate-key"],
-            ["doctor", "--server", "production", "--json"],
         ]
         with tempfile.TemporaryDirectory() as directory:
             for command in commands:

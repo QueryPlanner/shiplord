@@ -12,8 +12,10 @@ import typer
 from . import __version__
 from .configure import ConfigurationError, create_manifest
 from .manifest import ManifestError, load_manifest
-from .servers import InvalidTarget, ServerError, SSHCheckError, register_server
+from .protocol import IncompatibleProtocol
+from .servers import InvalidTarget, ServerError, SSHCheckError, load_server, register_server
 from .template import TemplateError, create_project
+from .transport import TransportError, probe_capabilities
 
 app = typer.Typer(no_args_is_help=True, help="Manage application releases. Remote operations are not implemented yet.")
 server_app = typer.Typer(no_args_is_help=True, help="Manage servers (not implemented yet).")
@@ -63,10 +65,28 @@ def plan(json_output: bool = typer.Option(False, "--json", help="Output JSON."))
 def doctor(local: bool = typer.Option(False, "--local", help="Check local prerequisites."),
            server: Optional[str] = typer.Option(None, "--server", help="Server alias."),
            json_output: bool = typer.Option(False, "--json", help="Output JSON.")) -> None:
-    """Check local prerequisites; server checks are not implemented."""
+    """Check local prerequisites or a server's protocol capabilities."""
     if local and server:
         _emit({"ok": False, "error": "choose either --local or --server"}, json_output)
         raise typer.Exit(2)
+    if server:
+        try:
+            response = probe_capabilities(load_server(server))
+        except ManifestError as exc:
+            _emit({"ok": False, "error": str(exc)}, json_output)
+            raise typer.Exit(2) from None
+        except IncompatibleProtocol:
+            _emit({"ok": False, "error": "incompatible helper protocol version"}, json_output)
+            raise typer.Exit(4) from None
+        except ServerError:
+            _emit({"ok": False, "error": "server capabilities check failed; verify the alias, SSH trust, login, and dispatcher"}, json_output)
+            raise typer.Exit(3) from None
+        except TransportError as exc:
+            _emit({"ok": False, "error": str(exc)}, json_output)
+            raise typer.Exit(3) from None
+        _emit({"ok": True, "scope": "protocol capabilities only; server readiness and deployment access were not checked",
+               "helper_version": response["helper_version"]}, json_output)
+        return
     if not local:
         _unavailable("server doctor", json_output)
     checks = {name: bool(shutil.which(name)) for name in ("ssh", "git", "gh")}

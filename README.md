@@ -35,6 +35,10 @@ not accept or update host keys automatically. This check does not verify sudo
 access or server readiness. CI host-key recording is not implemented yet.
 Server aliases are stored in the user-owned `shiplord/servers` directory under
 `XDG_CONFIG_HOME`, or under `~/.config` when that variable is unset.
+`shiplord doctor --server production --json` checks a server-scoped protocol
+handshake over SSH. It requires a compatible dispatcher at
+`/usr/local/libexec/shiplord-dispatch`, which Shiplord cannot install yet. A
+successful handshake does not establish deployment access or server readiness.
 
 Generate a project and create a manifest in its directory:
 
