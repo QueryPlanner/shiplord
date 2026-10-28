@@ -42,3 +42,19 @@ application authorization. A capability response does not authorize later
 requests. The transport must keep stdout free of diagnostics and enforce finite
 read and write deadlines. The framing functions do not enforce deadlines or
 authorization themselves.
+
+## Application-bound prototype
+
+`python -m shiplord.privileged_host` is a separate capabilities-only prototype.
+It expects root execution, a nonroot sudo caller, and a root-owned registration
+at `/etc/shiplord/apps/<application>.json`. The registration binds the app to a
+deployment UID and username. The helper checks both values against the sudo
+environment and the system account database before reporting capabilities. It
+rejects non-capability actions and accepts no command-line arguments.
+
+The effective sudo policy is the security boundary. A root process can forge
+sudo environment variables, so those values do not prove how root was invoked.
+The policy must grant only the fixed, root-owned helper with no arguments and
+must prevent environment preservation. Real sudo behavior and account isolation
+must pass on a disposable runner before production installation. This prototype
+does not install sudo policy, provision applications, or perform deployment.

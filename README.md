@@ -8,7 +8,8 @@ The CLI generates a project from a pinned template, creates and validates a
 local manifest, registers an already trusted SSH server, checks a few local
 prerequisites, and includes an unprivileged capabilities-only helper prototype.
 Server bootstrap, deployment, and GitHub setup operations are not implemented.
-No privileged server helper has been installed.
+An application-bound privileged helper prototype also supports capabilities
+only. No privileged server helper has been installed.
 
 ## Install
 

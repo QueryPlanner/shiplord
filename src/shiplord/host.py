@@ -54,11 +54,12 @@ def serve(source: BinaryIO, destination: BinaryIO) -> int:
     return code
 
 
-def main() -> None:
+def run_timed(handler) -> int:
+    """Run one stdio request with a server-side deadline."""
     signal.signal(signal.SIGALRM, _deadline_expired)
     signal.setitimer(signal.ITIMER_REAL, DEADLINE_SECONDS)
     try:
-        code = serve(sys.stdin.buffer, sys.stdout.buffer)
+        code = handler(sys.stdin.buffer, sys.stdout.buffer)
     except HostDeadline:
         signal.setitimer(signal.ITIMER_REAL, 0)
         try:
@@ -73,7 +74,11 @@ def main() -> None:
         code = 3
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
-    raise SystemExit(code)
+    return code
+
+
+def main() -> None:
+    raise SystemExit(run_timed(serve))
 
 
 if __name__ == "__main__":
