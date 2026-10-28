@@ -9,7 +9,9 @@ import re
 import secrets
 import stat
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 from .manifest import validate_app_name
 from .protocol import _invalid_constant, _unique_keys
@@ -132,17 +134,52 @@ def _save_server(alias: str, target: str) -> None:
             os.close(directory)
 
 
-def ssh_command(target: str, remote_command: str) -> list[str]:
+@dataclass(frozen=True)
+class SshOptions:
+    """Connection settings that do not come from the user's OpenSSH configuration (used by CI)."""
+
+    identity: Path | None = None
+    known_hosts: Path | None = None
+    port: int | None = None
+
+    @classmethod
+    def from_environment(cls, environ: Mapping[str, str]) -> "SshOptions":
+        # An empty value (an unset GitHub variable expands to "") means "not set".
+        identity, known_hosts, port = (environ.get("SHIPLORD_SSH_IDENTITY") or None,
+                                       environ.get("SHIPLORD_SSH_KNOWN_HOSTS_FILE") or None,
+                                       environ.get("SHIPLORD_SSH_PORT") or None)
+        for name, value in (("SHIPLORD_SSH_IDENTITY", identity), ("SHIPLORD_SSH_KNOWN_HOSTS_FILE", known_hosts)):
+            if value is not None and (not os.path.isabs(value) or not os.path.isfile(value)):
+                raise ServerError(f"{name} must be the absolute path of an existing file")
+        if port is not None and not (port.isdigit() and 1 <= int(port) <= 65535):
+            raise ServerError("SHIPLORD_SSH_PORT must be a port number")
+        return cls(Path(identity) if identity else None, Path(known_hosts) if known_hosts else None,
+                   int(port) if port else None)
+
+
+def ssh_command(target: str, remote_command: str, options: SshOptions | None = None) -> list[str]:
     """Build a fresh, host-key-checked SSH invocation from a validated target."""
     target = validate_target(target)
-    options = [
+    settings = [
         "BatchMode=yes", "StrictHostKeyChecking=yes", "VerifyHostKeyDNS=no",
         "UpdateHostKeys=no", "ControlMaster=no", "ControlPath=none",
         "ClearAllForwardings=yes", "ForwardAgent=no", "RequestTTY=no",
         "ConnectTimeout=10", "ConnectionAttempts=1",
     ]
     command = ["ssh"]
-    for option in options:
+    if options is not None:
+        if options.identity and options.known_hosts:
+            # Pinned mode (CI, and the setup check that proves the CI key): ignore the user's ~/.ssh/config, which would
+            # otherwise add the personal identity, other known-hosts files, and proxies behind the pinned settings.
+            command.extend(["-F", "/dev/null"])
+        if options.identity:
+            command.extend(["-i", str(options.identity)])
+            settings.append("IdentitiesOnly=yes")
+        if options.known_hosts:  # the pinned file is the only trust source; no system or user fallback
+            settings.extend([f"UserKnownHostsFile={options.known_hosts}", "GlobalKnownHostsFile=/dev/null"])
+        if options.port:
+            command.extend(["-p", str(options.port)])
+    for option in settings:
         command.extend(["-o", option])
     command.extend(["--", target, remote_command])
     return command

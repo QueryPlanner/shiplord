@@ -89,12 +89,55 @@ def _replace_once(path: Path, old: str, new: str) -> None:
         raise TemplateError("pinned template content could not be adapted") from None
 
 
+SHIPLORD_GUIDE = """# Releasing with Shiplord
+
+This project deploys to a server with `shiplord`. The server never builds anything; it runs the image CI built.
+Existing template files are untouched: Shiplord starts the container itself and allocates the host port, so the
+template's own `compose.yaml` is not used on the server.
+
+## One-time setup (a person with server access)
+
+```sh
+shiplord server add production --ssh <admin>@<server>     # a server you can already SSH into
+shiplord server bootstrap production                      # once per server
+shiplord configure --server production --api-domain <api hostname> --frontend <origin>   # or --no-frontend
+shiplord provision
+shiplord env set --from-file <file with DATABASE_URL, API keys, ...>
+shiplord registry login --username <user> --token-file <read-only token>   # only for a private image
+shiplord github setup --repo <owner>/<repository> --tooling-ref <shiplord commit>
+```
+
+Create the DNS record for the API hostname yourself. Finish the Tailscale federation described in the output of
+`shiplord github setup`, then push to `main`.
+
+## Releasing
+
+Merging to `main` runs `.github/workflows/shiplord-release.yml`: the template's quality checks, an image build, and
+`shiplord deploy` by digest. To release by hand: `shiplord deploy --image <registry/name@sha256:digest> --commit <sha>`.
+
+## Reading results (exit codes)
+
+| Exit | Meaning | Do |
+| --- | --- | --- |
+| 0 | Deployed and verified ready | Report the commit and the API hostname from `ship.toml` |
+| 1 | Failed, stale, or recovery required | Read the message; `shiplord recover` if told to |
+| 2 | Invalid input | Fix it; do not retry unchanged |
+| 3 | Missing prerequisite (SSH, sudo, DNS) | `shiplord doctor` |
+| 5 | The release failed and the previous one is serving | Report it as a failure; see `shiplord logs` |
+| 6 | Needs intervention | `shiplord recover` |
+
+`shiplord status` shows what is deployed. `shiplord rollback` returns to the previous release. Never run Docker,
+systemctl, or Caddy on the server by hand, and never put secrets in `ship.toml` or on a command line.
+"""
+
+
 def _adapt(directory: Path, name: str) -> None:
     _replace_once(directory / "pyproject.toml", 'name = "google-adk-on-bare-metal"', f'name = "{name}"')
     _replace_once(directory / "uv.lock", 'name = "google-adk-on-bare-metal"', f'name = "{name}"')
     _replace_once(directory / ".env.example", "AGENT_NAME=local-agent", f"AGENT_NAME={name}")
     _replace_once(directory / "tests/test_dependabot.py", 'package["name"] == "google-adk-on-bare-metal"', 'package["name"] == project["project"]["name"]')
     _replace_once(directory / "tests/test_deployment_workflow.py", 'package["name"] == "google-adk-on-bare-metal"', 'package["name"] == project["project"]["name"]')
+    (directory / "SHIPLORD.md").write_text(SHIPLORD_GUIDE, encoding="utf-8")  # a new file: no template file is edited
     (directory / ".shiplord-template.json").write_text(json.dumps({
         "repository": TEMPLATE_REPOSITORY, "commit": TEMPLATE_COMMIT, "application": name,
     }, indent=2) + "\n", encoding="utf-8")

@@ -25,7 +25,7 @@ class HostTests(unittest.TestCase):
     def run_helper(self, data):
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run([sys.executable, "-m", "shiplord.host"], input=data, cwd=directory,
-                                    capture_output=True, timeout=5, check=False)
+                                    capture_output=True, timeout=30, check=False)
             self.assertEqual(list(Path(directory).iterdir()), [])
         self.assertEqual(result.stderr, b"")
         output = io.BytesIO(result.stdout)

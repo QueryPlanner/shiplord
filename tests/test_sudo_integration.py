@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 import shiplord
+from shiplord.installer import helper_modules
 
 
 @unittest.skipUnless(os.environ.get("SHIPLORD_TEST_SUDO") == "1", "requires disposable Ubuntu sudo runner")
@@ -45,7 +46,7 @@ class SudoIntegrationTests(unittest.TestCase):
         cls.run_root("install", "-d", "-m", "0755", cls.registration / "apps")
         cls.addClassCleanup(cls.remove_path, cls.registration)
         source = Path(shiplord.__file__).parent
-        for name in ("__init__.py", "host.py", "framing.py", "protocol.py", "authorization.py", "privileged_host.py"):
+        for name in helper_modules(source):  # exactly what the real installer ships
             cls.run_root("install", "-m", "0644", source / name, cls.payload / "shiplord" / name)
         launcher = cls.root / "launcher.py"
         launcher.write_text(f'import sys\nsys.path.insert(0, "{cls.payload}")\nfrom shiplord.privileged_host import main\nmain()\n')
@@ -54,10 +55,12 @@ class SudoIntegrationTests(unittest.TestCase):
         wrapper.write_text(f'#!/bin/sh\nexec /usr/bin/python3 -I -S -B "{cls.payload / "launcher.py"}"\n')
         cls.helper = cls.payload / "helper"
         cls.run_root("install", "-m", "0755", wrapper, cls.helper)
-        for app, user, uid in zip(("orders", "billing"), cls.users, cls.uids):
+        for number, (app, user, uid) in enumerate(zip(("orders", "billing"), cls.users, cls.uids)):
             path = cls.root / f"{app}.json"
             path.write_text(json.dumps({"schema_version": 1, "application_id": app,
-                                        "deployment_uid": uid, "deployment_user": user}))
+                                        "deployment_uid": uid, "deployment_user": user, "runtime": "docker",
+                                        "api_domain": f"{app}.example.com", "host_port": 20000 + number,
+                                        "image_repository": f"ghcr.io/example/{app}", "max_memory_mb": 4096}))
             cls.run_root("install", "-m", "0644", path, cls.registration / "apps" / path.name)
         policy = cls.root / "sudoers"
         policy.write_text("".join(f'{user} ALL=(root) NOPASSWD: NOSETENV: {cls.helper} ""\n' for user in cls.users))
@@ -92,7 +95,8 @@ class SudoIntegrationTests(unittest.TestCase):
             with self.subTest(user=user):
                 allowed = self.sudo(user, own)
                 self.assertEqual(allowed.returncode, 0)
-                self.assertEqual(self.parse(allowed)["actions"], ["capabilities"])
+                self.assertEqual(self.parse(allowed)["actions"],
+                         ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover"])
                 denied = self.sudo(user, other)
                 self.assertEqual(denied.returncode, 3)
                 self.assertEqual(self.parse(denied)["error"], "access_denied")

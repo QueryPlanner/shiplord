@@ -62,6 +62,11 @@ class TemplateTests(unittest.TestCase):
             self.assertEqual((target / ".env.example").read_text(), "AGENT_NAME=orders\n")
             self.assertIn('package["name"] == project["project"]["name"]', (target / "tests/test_deployment_workflow.py").read_text())
             self.assertEqual(json.loads((target / ".shiplord-template.json").read_text())["commit"], TEMPLATE_COMMIT)
+            guide = (target / "SHIPLORD.md").read_text()
+            for fragment in ("shiplord provision", "shiplord deploy --image", "shiplord recover", "Exit"):
+                self.assertIn(fragment, guide)
+            self.assertEqual(sorted(p.name for p in target.iterdir() if p.is_file()),
+                             sorted([".env.example", ".shiplord-template.json", "SHIPLORD.md", "entrypoint.sh", "pyproject.toml", "uv.lock"]))
             self.assertTrue((target / "entrypoint.sh").stat().st_mode & 0o111)
             self.assertTrue((target / "empty-directory").is_dir())
 

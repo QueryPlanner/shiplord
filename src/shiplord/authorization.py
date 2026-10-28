@@ -10,6 +10,7 @@ import stat
 from pathlib import Path
 
 from .protocol import _invalid_constant, _unique_keys
+from .registry import validate_registration
 
 REGISTRATION_ROOT = Path("/etc/shiplord/apps")
 _APP = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
@@ -38,8 +39,11 @@ def _trusted_directory(path: Path) -> int:
         raise
 
 
-def authorize_application(application_id: object) -> None:
+def authorize_application(application_id: object) -> dict:
     """Require consistent sudo identity and a root-owned app registration.
+
+    Returns the validated registration, which is the source of truth for the
+    application's runtime, hostname, image repository, and host port.
 
     The effective sudo policy is the security boundary. Root can forge sudo
     environment variables, so this check does not authenticate root itself.
@@ -70,12 +74,9 @@ def authorize_application(application_id: object) -> None:
         if len(data) > 4096:
             raise AuthorizationError("application access denied")
         registration = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_keys, parse_constant=_invalid_constant)
-        if (not isinstance(registration, dict)
-                or set(registration) != {"schema_version", "application_id", "deployment_uid", "deployment_user"}
-                or type(registration["schema_version"]) is not int or registration["schema_version"] != 1
-                or registration["application_id"] != application_id
-                or type(registration["deployment_uid"]) is not int or registration["deployment_uid"] != uid
-                or registration["deployment_user"] != user):
+        registration = validate_registration(registration, application_id)
+        if registration["deployment_uid"] != uid or registration["deployment_user"] != user:
             raise AuthorizationError("application access denied")
+        return registration
     except (OSError, KeyError, UnicodeDecodeError, ValueError):
         raise AuthorizationError("application access denied") from None

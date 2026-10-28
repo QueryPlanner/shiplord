@@ -11,6 +11,8 @@ MAX_MESSAGE_BYTES = 1024 * 1024
 _IDENTIFIER = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _ACTIONS = {"capabilities", "plan", "deploy", "status", "logs", "rollback", "recover"}
+ADMIN_ACTIONS = {"provision", "keys", "environment", "registry", "deprovision", "doctor"}
+HOSTWIDE_ACTIONS = {"capabilities", "doctor"}  # requests that name no application
 
 
 class ProtocolError(ValueError):
@@ -32,7 +34,8 @@ def decode_request(data: bytes) -> dict[str, Any]:
     return validate_request(message)
 
 
-def validate_request(message: object, *, require_compatible: bool = True) -> dict[str, Any]:
+def validate_request(message: object, *, require_compatible: bool = True,
+                     actions: set[str] | frozenset[str] = _ACTIONS) -> dict[str, Any]:
     """Validate the envelope; action arguments still require action-specific checks."""
     if not isinstance(message, dict):
         raise ProtocolError("protocol request must be an object")
@@ -44,11 +47,11 @@ def validate_request(message: object, *, require_compatible: bool = True) -> dic
         raise ProtocolError("incompatible protocol version")
     for field in ("request_id", "application_id"):
         value = message[field]
-        if field == "application_id" and value is None and message.get("action") == "capabilities":
+        if field == "application_id" and value is None and message.get("action") in HOSTWIDE_ACTIONS:
             continue
         if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
             raise ProtocolError(f"invalid {field}")
-    if not isinstance(message["action"], str) or message["action"] not in _ACTIONS:
+    if not isinstance(message["action"], str) or message["action"] not in actions:
         raise ProtocolError("invalid action")
     commit = message["commit"]
     if commit is not None and (not isinstance(commit, str) or not _COMMIT.fullmatch(commit)):

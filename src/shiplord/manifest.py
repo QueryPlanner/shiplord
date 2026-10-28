@@ -60,6 +60,11 @@ def _hostname(value: object, name: str) -> str:
     raise ManifestError(f"{name} must be a DNS hostname, not an IP address")
 
 
+def validate_hostname(value: object, name: str) -> str:
+    """Validate a lowercase DNS hostname (never an IP address)."""
+    return _hostname(value, name)
+
+
 def _origin(value: object) -> str:
     origin = _string(value, "http.frontend_origins item")
     try:
@@ -126,8 +131,9 @@ def validate_manifest(raw: dict) -> dict:
     resources = _table(root.get("resources"), "resources", {"memory_mb"})
     memory = _integer(resources.get("memory_mb"), "resources.memory_mb", 1, 1048576)
     deploy = _table(root.get("deploy"), "deploy", {"readiness_timeout_seconds", "retain_successful_releases"})
-    timeout = _integer(deploy.get("readiness_timeout_seconds"), "deploy.readiness_timeout_seconds", 1, 3600)
-    retain = _integer(deploy.get("retain_successful_releases"), "deploy.retain_successful_releases", 2, 100)
+    timeout = _integer(deploy.get("readiness_timeout_seconds"), "deploy.readiness_timeout_seconds", 1, 900)
+    retain = _integer(deploy.get("retain_successful_releases"), "deploy.retain_successful_releases", 2, 2)
+    # Only the current and the previous release are kept (rollback needs exactly those), so other values would mislead.
     result = {"schema_version": 1, "name": name, "server": server, "template": template, "runtime": runtime,
             "http": {"api_domain": domain, "frontend_origins": validated_origins, "container_port": port, "readiness_path": readiness},
             "resources": {"memory_mb": memory}, "deploy": {"readiness_timeout_seconds": timeout, "retain_successful_releases": retain}}

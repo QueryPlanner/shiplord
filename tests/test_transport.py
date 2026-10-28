@@ -242,10 +242,16 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(ServerError):
                 load_server("production")
 
-    def test_doctor_without_mode_reports_unimplemented_app_check(self):
-        result = CliRunner().invoke(app, ["doctor", "--json"])
-        self.assertEqual(result.exit_code, 1)
-        self.assertIn("not implemented", json.loads(result.stdout)["error"])
+    def test_doctor_without_a_mode_needs_an_application_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = os.getcwd()
+            os.chdir(directory)
+            try:
+                result = CliRunner().invoke(app, ["doctor", "--json"])
+            finally:
+                os.chdir(original)
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("ship.toml", json.loads(result.stdout)["error"])
 
     def test_server_capabilities_is_the_only_request_without_an_application(self):
         base = {"version": 1, "request_id": "request-1", "action": "capabilities", "application_id": None,
