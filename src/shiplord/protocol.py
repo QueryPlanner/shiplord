@@ -22,7 +22,7 @@ def decode_request(data: bytes) -> dict[str, Any]:
     if len(data) > MAX_MESSAGE_BYTES:
         raise ProtocolError("protocol message exceeds the size limit")
     try:
-        message = json.loads(data, object_pairs_hook=_unique_keys, parse_constant=_invalid_constant)
+        message = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_keys, parse_constant=_invalid_constant)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise ProtocolError("invalid protocol JSON") from None
     if not isinstance(message, dict):
