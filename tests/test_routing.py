@@ -541,6 +541,15 @@ class SubprocessCaddyTests(unittest.TestCase):
         self.assertNotIn("SHIPLORD_SECRET_TEST", names)
         self.assertIn("PATH", names)
 
+    def test_validation_writes_caddy_storage_to_a_throwaway_home_never_the_working_directory(self):
+        out = self.directory / "home"
+        caddy = self.script("caddy", f'echo "$HOME|$XDG_DATA_HOME" > {out}; mkdir "$HOME/caddy"\n')
+        SubprocessCaddy(caddy).validate(Path("/x"))
+        home, data = out.read_text().strip().split("|")
+        self.assertEqual(home, data)
+        self.assertIn("shiplord-caddy-validate-", home)
+        self.assertFalse(Path(home).exists())  # removed afterwards, with anything Caddy wrote there
+
     def test_failure_exposes_capped_clean_detail_but_not_in_the_message(self):
         caddy = self.script("caddy", 'printf "bad\\033[31m config\\n"; head -c 200000 /dev/zero | tr "\\0" x; exit 3\n')
         with self.assertRaises(RoutingError) as caught:

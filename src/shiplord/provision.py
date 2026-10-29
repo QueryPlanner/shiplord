@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import shutil
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -25,6 +26,9 @@ from .release_state import HostLock, ReleaseState, StateError
 from .system import CommandError, System
 
 USERADD, USERMOD, USERDEL = "/usr/sbin/useradd", "/usr/sbin/usermod", "/usr/sbin/userdel"
+LOGINCTL = "/usr/bin/loginctl"
+USERDEL_LOGGED_IN = 8  # userdel(8): the account is still logged in or has running processes
+USERDEL_ATTEMPTS = 10
 GETENT, VISUDO = "/usr/bin/getent", "/usr/sbin/visudo"
 SUDOERS_RULE = '{user} ALL=(root) NOPASSWD: NOSETENV: {helper} ""\n'
 
@@ -328,8 +332,30 @@ def manage_registry(layout: Layout, application_id: str, operation: str, *, regi
     return summary()
 
 
+def _remove_account(system: System, name: str, sleep: Callable[[float], None]) -> None:
+    """Delete the account; end what keeps it logged in first (its access is already revoked by now).
+
+    After an SSH session closes, pam_systemd's per-user manager can outlive it for a while, and userdel refuses an
+    account that still has processes.
+    """
+    for attempt in range(USERDEL_ATTEMPTS):
+        code = _run(system, [USERDEL, name], "userdel").code
+        if code == 0:
+            return
+        if code != USERDEL_LOGGED_IN:
+            break
+        if attempt == 0:
+            try:
+                system.run([LOGINCTL, "terminate-user", name])
+            except CommandError:
+                pass  # no logind: the processes may still exit by themselves
+        sleep(1.0)
+    raise ProvisionError("could not remove the deployment account; end its sessions and retry")
+
+
 def deprovision(layout: Layout, system: System, lock: HostLock, application_id: str, *,
-                retire: Callable[[dict, dict], None] | None = None) -> dict:
+                retire: Callable[[dict, dict], None] | None = None,
+                sleep: Callable[[float], None] = time.sleep) -> dict:
     """Remove an application's access and host resources.
 
     While a release is deployed this refuses, unless ``retire(registration, state)`` is given: it stops the runtime,
@@ -380,8 +406,7 @@ def deprovision(layout: Layout, system: System, lock: HostLock, application_id: 
     if account is not None:
         if account["comment"] != _marker(app):
             raise ProvisionError("refusing to remove an account that is not a Shiplord deployment account")
-        if _run(system, [USERDEL, name], "userdel").code != 0:
-            raise ProvisionError("could not remove the deployment account; end its sessions and retry")
+        _remove_account(system, name, sleep)
     removed["account"] = account is not None
     for directory, key in ((layout.app_state / app, "state_directory"), (layout.environments / app, "environment_directory"),
                            (layout.registry_logins / app, "registry_login")):

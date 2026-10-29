@@ -19,6 +19,7 @@ import os
 import re
 import secrets
 import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Protocol
@@ -67,14 +68,18 @@ class SubprocessCaddy:
         self.caddy, self.systemctl, self.timeout = caddy, systemctl, timeout
 
     def validate(self, config: Path) -> None:
-        self._run([self.caddy, "validate", "--config", str(config), "--adapter", "caddyfile"], "validation")
+        # Validation provisions modules (e.g. a local CA), which writes to Caddy's storage. Without HOME, Caddy falls
+        # back to ./caddy in the current directory; give it a throwaway home so it never touches real storage or cwd.
+        with tempfile.TemporaryDirectory(prefix="shiplord-caddy-validate-") as home:
+            self._run([self.caddy, "validate", "--config", str(config), "--adapter", "caddyfile"], "validation",
+                      env={**self.ENVIRONMENT, "HOME": home, "XDG_DATA_HOME": home, "XDG_CONFIG_HOME": home})
 
     def reload(self) -> None:
         self._run([self.systemctl, "reload", "caddy"], "reload")
 
-    def _run(self, argv: list[str], kind: str) -> None:
+    def _run(self, argv: list[str], kind: str, env: dict[str, str] | None = None) -> None:
         try:
-            result = run_command(argv, timeout=self.timeout, env=self.ENVIRONMENT)
+            result = run_command(argv, timeout=self.timeout, env=env or self.ENVIRONMENT)
         except CommandError as error:
             message = "Caddy command timed out" if error.kind == "timeout" else "could not start the Caddy command"
             raise RoutingError(message, kind, detail=error.output) from None

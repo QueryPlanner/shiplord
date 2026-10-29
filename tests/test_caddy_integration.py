@@ -163,6 +163,7 @@ class RealCaddyTests(unittest.TestCase):
 
     def test_invalid_existing_route_is_reported_as_preexisting_and_nothing_changes(self):
         (self.root / "ship" / "broken.caddy").write_text("broken.example.com {\n\tnot_a_directive\n}\n")
+        (self.root / "ship" / "broken.caddy").chmod(0o644)  # independent of the umask; group-writable files are refused
         before = {p.name: p.read_bytes() for p in (self.root / "ship").iterdir()}
         with self.lock.acquire(), self.assertRaisesRegex(RoutingError, "already invalid"):
             self.manager.apply(self.registration(managed_port(set())))
@@ -176,7 +177,7 @@ class RealCaddyTests(unittest.TestCase):
         self.assertEqual(caught.exception.kind, "conflict")
         # Caddy itself accepts this configuration, so only the scan prevents the takeover.
         self.assertEqual(run_command([shutil.which("caddy"), "validate", "--config", str(self.caddyfile),
-                                      "--adapter", "caddyfile"]).code, 0)
+                                      "--adapter", "caddyfile"], env=dict(os.environ, HOME=str(self.data_home))).code, 0)
 
     def test_reload_failure_with_caddy_stopped_restores_the_file_and_flags_intervention(self):
         port = managed_port(set())

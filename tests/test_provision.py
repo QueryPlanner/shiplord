@@ -44,6 +44,7 @@ class FakeSystem:
         self.visudo_code = 0
         self.next_uid = 900
         self.fail = set()
+        self.busy_userdel = 0
 
     def run(self, argv, *, input=None, timeout=60):
         argv = list(argv)
@@ -66,7 +67,12 @@ class FakeSystem:
             self.users[argv[-1]]["password"] = argv[argv.index("--password") + 1]
             return CommandResult(0, "")
         if tool == "userdel":
+            if self.busy_userdel:  # a lingering session: userdel reports "currently logged in" until it ends
+                self.busy_userdel -= 1
+                return CommandResult(8, "userdel: user is currently used by process 1234")
             return CommandResult(0, "") if self.users.pop(argv[-1], None) else CommandResult(6, "")
+        if tool == "loginctl":
+            return CommandResult(0, "")
         if tool == "systemctl":
             return CommandResult(0, "")
         if tool == "visudo":
@@ -258,6 +264,29 @@ class NativeProvisionTests(ProvisionTestCase):
         self.assertEqual(len(result["retained"]), 1)
         self.assertIn("app-orders", self.system.users)
         self.assertTrue(any(c[1:3] == ["disable", "--now"] for c in self.system.calls if c[0].endswith("systemctl")))
+
+
+class AccountRemovalTests(ProvisionTestCase):
+    def test_a_lingering_session_is_ended_and_removal_retried(self):
+        self.provision()
+        self.system.busy_userdel = 2
+        slept = []
+        with self.lock.acquire():
+            result = deprovision(self.layout, self.system, self.lock, "orders", sleep=slept.append)
+        self.assertTrue(result["removed"]["account"])
+        tools = [c[0].rsplit("/", 1)[-1] for c in self.system.calls]
+        self.assertEqual(tools.count("loginctl"), 1)
+        self.assertLess(tools.index("loginctl"), len(tools) - 1 - tools[::-1].index("userdel"))
+        self.assertIn(["/usr/bin/loginctl", "terminate-user", "ship-orders"], self.system.calls)
+        self.assertEqual(len(slept), 2)
+
+    def test_a_session_that_never_ends_fails_clearly_after_bounded_retries(self):
+        self.provision()
+        self.system.busy_userdel = 1000
+        slept = []
+        with self.lock.acquire(), self.assertRaisesRegex(ProvisionError, "end its sessions"):
+            deprovision(self.layout, self.system, self.lock, "orders", sleep=slept.append)
+        self.assertEqual(len(slept), 10)
 
 
 class KeyManagementTests(ProvisionTestCase):
