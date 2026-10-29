@@ -212,14 +212,17 @@ def detect_tooling_ref() -> str | None:
 
 # --- operations ---------------------------------------------------------------------------
 
-def _verify_ci_access(application_id: str, admin_target: str, host: str, port: int, private: Path,
+def _verify_ci_access(application_id: str, host: str, port: int, private: Path,
                       keys: list[tuple[str, str]], runner=run_ssh) -> None:
-    """Prove the CI key works against the pinned host keys, exactly as the workflow will use it."""
+    """Prove the CI key works against the pinned host keys, exactly as the workflow will use it.
+
+    CI ignores ~/.ssh/config, so this connects to the resolved host name, never to the administrator's SSH alias.
+    """
     with tempfile.TemporaryDirectory() as temp:
         pinned = Path(temp) / "known_hosts"
         pinned.write_text(known_hosts_lines(host, port, keys))
-        client = HelperClient(application_id, admin_target, runner=runner,
-                              ssh_options=SshOptions(private, pinned, port if port != 22 else None))
+        client = HelperClient(application_id, f"{deployment_user(application_id)}@{host}", runner=runner,
+                              ssh_options=SshOptions(private, pinned, port if port != 22 else None), explicit_target=True)
         try:
             client.call("capabilities")
         except ClientError as error:
@@ -271,7 +274,7 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
         except ClientError as error:
             raise GitHubError(f"could not register the CI key on the server: {error}", error.code, "register") from None
         steps["ci_key"] = f"registered {state['label']}"
-        _verify_ci_access(app, admin_target, host, port, private, keys, runner)
+        _verify_ci_access(app, server_host, port, private, keys, runner)
         steps["ssh_check"] = "the CI key authenticated against the pinned host keys"
         gh.set_secret(repository, SECRET_NAME, private.read_bytes())
         state["secret_set"] = True
@@ -293,13 +296,18 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
     steps["workflow"] = _write_workflow(manifest, repository, project, state, directory, tooling_ref, platforms, force_workflow)
     _ensure_manifest_github(project, manifest, repository)
     steps["manifest"] = f"ship.toml names {repository}"
-    remaining = ["Create the Tailscale workload-identity federation for this repository and grant tag:ci access to the "
-                 "server's SSH port, then set SHIPLORD_TS_CLIENT_ID and SHIPLORD_TS_AUDIENCE (Shiplord cannot do this "
-                 "without Tailscale administrative credentials).",
-                 "Give the server a read-only pull credential if the image is private: `shiplord registry login`.",
-                 "No GitHub Actions run has been performed: nothing here claims the pipeline works until one succeeds."]
+    remaining = []
     if not (tailscale and tailscale.get("SHIPLORD_TS_CLIENT_ID")):
         steps["tailscale"] = "not configured"
+        remaining.append("Create the Tailscale workload-identity federation for this repository and grant tag:ci access "
+                         "to the server's SSH port, then rerun with --tailscale-client-id and --tailscale-audience "
+                         "(Shiplord cannot do this without Tailscale administrative credentials).")
+    else:
+        remaining.append("Make sure the Tailscale trust credential gives tag:ci and that tag:ci may reach the server's "
+                         "SSH port; Shiplord cannot check the tailnet policy.")
+    if manifest["runtime"] == "docker":
+        remaining.append("Give the server a read-only pull credential if the image is private: `shiplord registry login`.")
+    remaining.append("No GitHub Actions run has been performed: nothing here claims the pipeline works until one succeeds.")
     return {"ok": True, "repository": repository, "github_account": account, "key_label": state["label"],
             "key_fingerprint": state["fingerprint"], "server_host": server_host, "steps": steps, "remaining": remaining}
 
@@ -379,7 +387,7 @@ def rotate_key(manifest: dict, *, admin: AdminClient, gh: GitHub, admin_target: 
         private.unlink(missing_ok=True)
         raise GitHubError(f"could not register the new CI key: {error}", error.code, "register") from None
     try:
-        _verify_ci_access(app, admin_target, host, port, private, keys, runner)
+        _verify_ci_access(app, host, port, private, keys, runner)
         gh.set_secret(repository, SECRET_NAME, private.read_bytes())
     except GitHubError:
         try:  # the old key stays in place and in GitHub; do not leave the unused new one registered

@@ -108,6 +108,7 @@ class WorkflowTests(unittest.TestCase):
         step = next(s for s in self.steps("deploy") if "tailscale/github-action" in s.get("uses", ""))
         self.assertEqual(step["with"]["oauth-client-id"], "${{ vars.SHIPLORD_TS_CLIENT_ID }}")
         self.assertEqual(step["with"]["audience"], "${{ vars.SHIPLORD_TS_AUDIENCE }}")
+        self.assertEqual(step["with"]["ping"], "${{ vars.SHIPLORD_SERVER_HOST }}")  # waits until the server is reachable
         self.assertIn("tag:ci", step["with"]["tags"])
         self.assertNotIn("oauth-secret", self.text)  # federation: no long-lived Tailscale secret
 

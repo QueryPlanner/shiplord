@@ -135,6 +135,8 @@ jobs:
           oauth-client-id: ${{{{ vars.SHIPLORD_TS_CLIENT_ID }}}}
           audience: ${{{{ vars.SHIPLORD_TS_AUDIENCE }}}}
           tags: ${{{{ vars.SHIPLORD_TS_TAGS || 'tag:ci' }}}}
+          # A new node is not accepted by its peers immediately; wait until the server answers.
+          ping: ${{{{ vars.SHIPLORD_SERVER_HOST }}}}
       - name: Prepare the SSH identity and pinned host keys
         env:
           SSH_PRIVATE_KEY: ${{{{ secrets.SHIPLORD_SSH_PRIVATE_KEY }}}}

@@ -201,6 +201,18 @@ class SetupTests(GitHubTestCase):
             self.assertNotIn(blob[:40], variable)
         self.assertIsNone(self.state()["private_key"])
 
+    def test_the_key_is_proven_against_the_resolved_host_not_the_ssh_alias(self):
+        # CI runs ssh with -F /dev/null, so an alias from ~/.ssh/config would never resolve there.
+        targets = []
+
+        def runner(command, payload, timeout):
+            targets.append(command[-2])
+            return self.server.runner(command, payload, timeout)
+        self.setup_call(admin_target="appuser@my-alias", resolve=lambda host: ("100.64.0.9", 22), runner=runner)
+        self.assertEqual(targets, ["ship-orders@100.64.0.9"])
+        self.assertEqual(self.server.ssh_events, ["ssh:True:100.64.0.9"])
+        self.assertEqual(self.gh_runner.variables_["SHIPLORD_SERVER_HOST"], "100.64.0.9")
+
     def test_repeating_setup_reuses_the_working_key(self):
         first = self.setup_call()
         before = dict(self.server.keys)
@@ -311,6 +323,13 @@ class SetupTests(GitHubTestCase):
         self.assertTrue(variables["SHIPLORD_SSH_KNOWN_HOSTS"].startswith("[tail.example.ts.net]:2222 ssh-ed25519 "))
         self.assertEqual(result["server_host"], "tail.example.ts.net")
         self.assertNotIn("tailscale", result["steps"])
+
+    def test_remaining_steps_do_not_ask_for_tailscale_settings_that_were_given(self):
+        given = " ".join(self.setup_call(tailscale={"SHIPLORD_TS_CLIENT_ID": "id", "SHIPLORD_TS_AUDIENCE": "aud"})["remaining"])
+        self.assertNotIn("--tailscale-client-id", given)
+        self.assertIn("tag:ci", given)
+        native = " ".join(self.setup_call(manifest=manifest("native"))["remaining"])
+        self.assertNotIn("registry login", native)
 
     def test_the_remaining_manual_steps_are_stated_and_no_run_is_claimed(self):
         text = " ".join(self.setup_call()["remaining"])
