@@ -143,6 +143,18 @@ What it found:
   baseline in real Docker (the unit test shows it at the `is_running` boundary). Unlabelled legacy volumes are
   accepted by name rather than by evidence of a retained container.
 
+## Graceful Docker replacement (PR 2)
+
+- Unit: `tests/test_shutdown.py` (scripted Docker with a fake clock: exit in time, force, fail, late exit, continuing attempt,
+  ambiguity, malformed metadata, legacy containers, signals, daemon errors, paused, disappearing/unkillable containers,
+  transaction and retirement behavior, budget, negotiation).
+- Real Docker (`tests/linux/run.sh docker`): signal-aware PID 1 flushes a SQLite row and file before the candidate starts;
+  an ignoring process is force-killed after its deadline; with `fail` the original keeps running, recovery refuses while it
+  drains and succeeds after it exits.
+- Not done: killing a real worker at each point in the stop sequence, the marked real 120-second drain test (short delays
+  used), persisted stop deadline across workers, SIGKILL-race around `docker kill` crash gap, rollback/failed-first-deploy
+  cleanup against real Docker, a seeded-baseline demonstration of the regression.
+
 ## Not verified, and why
 
 - The plan's controlled installation procedure (§12E) on your production server; the real server run above used a separate VM.

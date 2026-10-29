@@ -20,6 +20,7 @@ from .payload import PayloadError, discard_upload, receive_payload
 from .manifest import ManifestError
 from .protocol import PROTOCOL_VERSION, ProtocolError, validate_request
 from .release_state import StateError
+from .shutdown import FEATURE as SHUTDOWN_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
 
 if TYPE_CHECKING:  # the deployment machinery is imported lazily: a capabilities probe must stay light
@@ -30,7 +31,7 @@ UPLOAD_MINIMUM_RATE = 131072  # bytes per second the upload must sustain to fini
 UPLOAD_DEADLINE_CAP_SECONDS = 3600
 ACTIONS = ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover"]
 # Optional features are advertised in the same list: an older client rejects unknown response fields, but accepts any extra name.
-FEATURES = [STORAGE_FEATURE]
+FEATURES = [STORAGE_FEATURE, SHUTDOWN_FEATURE]
 
 
 class _UploadRejected(Exception):

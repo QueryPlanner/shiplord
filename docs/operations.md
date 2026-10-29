@@ -55,6 +55,10 @@ with `docker volume inspect` as an administrator and resolve it deliberately. A 
 when its image digest and its volume mount (name and path) match the release, so a path-only change is replaced and
 restored correctly.
 
+Shutdown: a `fail`-policy deadline exits 6 with `kind: shutdown_timeout`; the original container keeps running with its
+restart policy set to `no`. After it exits, `shiplord recover` restores the committed release. If recovery still reports
+a shutdown in progress, the process is still draining.
+
 A real reboot is not part of the automated tests. Docker containers use `--restart unless-stopped` and native
 units are enabled, but behavior after a power loss has not been verified.
 

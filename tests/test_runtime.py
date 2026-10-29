@@ -27,6 +27,7 @@ def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=
 
 
 LEGACY_VOLUME = CommandResult(0, "local|null|null\n")
+EXITED_LEGACY = CommandResult(0, "exited unless-stopped |<no value>|<no value>\n")  # a stopped container from before the policy
 REGISTRATION = {"application_id": "orders", "host_port": 20007, "api_domain": "orders.example.com"}
 
 
@@ -57,6 +58,7 @@ class RuntimeTestCase(unittest.TestCase):
         (self.layout.environments / "orders").mkdir(parents=True)
         self.docker = FakeDocker()
         self.docker.results["volume inspect"] = LEGACY_VOLUME  # an existing volume from before labels existed
+        self.docker.results["inspect"] = EXITED_LEGACY
         self.runtime = DockerRuntime(self.docker, self.layout, platform_name="linux/amd64")
 
 
@@ -140,7 +142,7 @@ class StartTests(RuntimeTestCase):
         argv = self.start(origins=["https://orders.example.com"])
         names = [c[1] for c in self.docker.calls]
         self.assertLess(names.index("rm"), names.index("run"))
-        self.assertEqual(self.docker.sub("rm")[0], ["/usr/bin/docker", "rm", "--force", ID_A, ID_B])
+        self.assertEqual(self.docker.sub("rm"), [["/usr/bin/docker", "rm", ID_A], ["/usr/bin/docker", "rm", ID_B]])  # never --force
         self.assertEqual(self.docker.sub("ps")[0][-1], "label=shiplord.app=orders")
         self.assertEqual(argv[-1], "ghcr.io/example/orders@sha256:" + "b" * 64)
         pairs = {argv[i]: argv[i + 1] for i in range(len(argv) - 1) if argv[i].startswith("--")}
@@ -189,7 +191,7 @@ class StartTests(RuntimeTestCase):
                                    ("run", CommandResult(125, "bad flag"), "start")):
             with self.subTest(key):
                 self.docker.calls.clear()
-                self.docker.results = {"volume inspect": LEGACY_VOLUME, "ps": CommandResult(0, ID_A + "\n"), key: result}
+                self.docker.results = {"volume inspect": LEGACY_VOLUME, "inspect": EXITED_LEGACY, "ps": CommandResult(0, ID_A + "\n"), key: result}
                 with self.assertRaises(RuntimeFailure) as caught:
                     self.runtime.start(REGISTRATION, release())
                 self.assertEqual(caught.exception.phase, phase)
@@ -203,7 +205,7 @@ class StartTests(RuntimeTestCase):
     def test_stop_removes_only_labelled_containers(self):
         self.docker.results["ps"] = CommandResult(0, ID_A + "\n")
         self.runtime.stop(REGISTRATION)
-        self.assertEqual(self.docker.sub("rm")[0], ["/usr/bin/docker", "rm", "--force", ID_A])
+        self.assertEqual(self.docker.sub("rm")[0], ["/usr/bin/docker", "rm", ID_A])
         self.docker.calls.clear()
         self.docker.results["ps"] = CommandResult(0, "")
         self.runtime.stop(REGISTRATION)

@@ -18,6 +18,7 @@ from .registry import validate_registration
 from .release_state import ReleaseState, StateError, validate_release
 from .routing import RouteManager, RoutingError
 from .runtime import Runtime, RuntimeFailure, release_id
+from .shutdown import ShutdownError, check_budget, policy
 from .storage import container_path
 
 MAX_FUTURE_SECONDS = 24 * 3600  # clock skew allowance; a far-future sequence would otherwise freeze the application
@@ -77,6 +78,12 @@ class Deployer:
             raise StateError("the artifact kind does not match the registered runtime")
         if candidate["configuration"]["http"]["api_domain"] != registration["api_domain"]:
             raise StateError("the hostname differs from the registration; changing it needs an administrator")
+        deploy = candidate["configuration"]["deploy"]
+        if "shutdown_timeout_seconds" in deploy or "shutdown_timeout_action" in deploy:
+            try:  # only an explicit policy is checked: configurations that predate it keep working as they were
+                check_budget(candidate["configuration"])
+            except ShutdownError as error:
+                raise StateError(str(error)) from None
         if "owner_uid" in candidate["configuration"].get("storage", {}):
             # The initializer that would establish ownership needs a pinned, reviewed image that does not exist yet.
             raise StateError("storage ownership (owner_uid/owner_gid) is not supported by this helper yet")
@@ -157,7 +164,14 @@ class Deployer:
             storage = {"storage": {"current_path": old, "candidate_path": new, "same_volume": True,
                                    "note": "the application's single volume is mounted at the candidate path; no files are moved "
                                            "and no data is migrated" if old not in (None, new) else "no path change"}}
-        return {"action": "deploy", "restarts_application": current is not None, **storage,
+        shutdown = {}
+        if candidate["artifact"]["kind"] == "docker":
+            outgoing = policy(current["configuration"]) if current else None
+            shutdown = {"shutdown": {"outgoing_policy": None if outgoing is None else {"timeout_seconds": outgoing[0], "action": outgoing[1]},
+                                     "candidate_policy": dict(zip(("timeout_seconds", "action"), policy(candidate["configuration"]))),
+                                     "note": "the outgoing container's own policy governs its stop; the candidate's applies "
+                                             "when it is later replaced"}}
+        return {"action": "deploy", "restarts_application": current is not None, **storage, **shutdown,
                 "route_change": {"absent": "create", "different": "replace", "identical": "none"}[route], **base}
 
     def rollback(self, request_id: str) -> Outcome:
@@ -232,6 +246,9 @@ class Deployer:
                                    "routing")
             self._advance("routing-ready")
         except (RuntimeFailure, ProbeFailure, RoutingError, _StepFailure, StateError) as failure:
+            if isinstance(failure, RuntimeFailure) and failure.intervention_required:
+                # The outgoing process was signalled and may still be draining: restoring would restart or remove it.
+                return self._intervention(failure, probes)
             return self._restore(failure, probes, candidate, before)
         try:
             self.state.record_commit()
@@ -243,7 +260,17 @@ class Deployer:
         probes["dns"] = self.probes.dns(self.registration)
         warnings = self._retire(before, candidate)
         return Outcome("succeeded", 0, {"release": identity(candidate), "previous": identity(before["current"]),
-                                        "image": prepared, "probes": probes, "warnings": warnings})
+                                        "image": prepared, "probes": probes, "warnings": warnings, **self._shutdown_report()})
+
+    def _shutdown_report(self) -> dict:
+        report = getattr(self.runtime, "stop_report", None)
+        return {"shutdown": list(report)} if report else {}
+
+    def _intervention(self, failure: Exception, probes: dict) -> Outcome:
+        """Retain the journal: the stop attempt cannot be retracted, so only a verified recovery may end it."""
+        return Outcome("intervention_required", 6, {"error": "intervention_required", **self._describe(failure),
+                                                     "probes": probes, **self._shutdown_report(),
+                                                     "recovery": "run `shiplord recover` once the application has exited"})
 
     def _advance(self, phase: str) -> None:
         self.progress(phase, {})
@@ -267,6 +294,11 @@ class Deployer:
             if route:
                 self.routes.reconcile(self.app, None)
             return
+        if getattr(self.runtime, "stop_in_progress", lambda registration: False)(self.registration):
+            # A signalled process is still draining. Declaring the journal reconciled (or recreating the container) would
+            # hide or repeat the stop attempt, so this stays unresolved until it has exited.
+            raise RuntimeFailure("a shutdown is still in progress for the application", "stop", intervention_required=True,
+                                 kind="shutdown_in_progress")
         if not (self.runtime.is_running(self.registration, target) and self.probes.ready_once(self.registration, target)):
             self.runtime.start(self.registration, target)
             self.probes.wait_ready(self.registration, target,

@@ -17,6 +17,7 @@ from .client import AdminClient, ClientError, HelperClient, new_request_id, subm
 from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
 from .runtime import RuntimeFailure
+from .shutdown import FEATURE as SHUTDOWN_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
 from .protocol import PROTOCOL_VERSION
 
@@ -222,13 +223,29 @@ def validate_deploy_inputs(manifest: dict, artifact: str | Path, commit: str) ->
     return resolved
 
 
-def require_storage_support(manifest: dict, client: HelperClient) -> None:
-    """Refuse explicit storage settings on a helper that would ignore them, before any job exists."""
-    if "storage" not in manifest:
+def uses_shutdown_policy(manifest: dict) -> bool:
+    return any(key in manifest["deploy"] for key in ("shutdown_timeout_seconds", "shutdown_timeout_action"))
+
+
+def require_feature_support(manifest: dict, client: HelperClient) -> None:
+    """Refuse explicit settings on a helper that would ignore them, before any plan or job exists."""
+    needed = [(STORAGE_FEATURE, "[storage]")] * ("storage" in manifest) \
+        + [(SHUTDOWN_FEATURE, "shutdown_timeout_*")] * uses_shutdown_policy(manifest)
+    if not needed:
         return
-    if STORAGE_FEATURE not in client.call("capabilities")["actions"]:
-        raise CommandError("the server helper does not support [storage]; re-run `shiplord server bootstrap` "
-                           "to upgrade it, then retry", 4)
+    advertised = client.call("capabilities")["actions"]
+    for feature, name in needed:
+        if feature not in advertised:
+            raise CommandError(f"the server helper does not support {name}; re-run `shiplord server bootstrap` "
+                               "to upgrade it, then retry", 4)
+
+
+def job_timeout(manifest: dict) -> float:
+    """How long the client waits for a job: readiness plus the old fixed allowance, plus both possible stops."""
+    from .shutdown import FORCE_EXIT_SECONDS, policy
+    timeout, _ = policy(manifest)
+    stops = 2 * (max(timeout, 10) + FORCE_EXIT_SECONDS) if manifest["runtime"] == "docker" else 0
+    return manifest["deploy"]["readiness_timeout_seconds"] + 900 + (stops if uses_shutdown_policy(manifest) else 0)
 
 
 def deploy_application(manifest: dict, client: HelperClient, *, image: str | None = None, binary: Path | None = None,
@@ -239,9 +256,9 @@ def deploy_application(manifest: dict, client: HelperClient, *, image: str | Non
         raise CommandError("specify exactly one of --image and --binary")
     artifact = validate_deploy_inputs(manifest, binary if binary is not None else image, commit)
     arguments = _deploy_arguments(manifest, artifact, sequence, allow_older)
-    require_storage_support(manifest, client)
+    require_feature_support(manifest, client)
     request_id = request_id or new_request_id("deploy")
-    timeout = timeout or manifest["deploy"]["readiness_timeout_seconds"] + 900
+    timeout = timeout or job_timeout(manifest)
     outcome = submit_and_wait(client, "deploy", request_id=request_id, commit=commit, arguments=arguments,
                               timeout=timeout, on_progress=on_progress, payload=binary)
     result = {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
@@ -263,7 +280,7 @@ def plan_application(manifest: dict, client: HelperClient, *, image: str | None 
         raise CommandError("specify exactly one of --image and --binary")
     artifact = validate_deploy_inputs(manifest, binary if binary is not None else image, commit)
     arguments = _deploy_arguments(manifest, artifact, sequence, allow_older)
-    require_storage_support(manifest, client)
+    require_feature_support(manifest, client)
     response = client.call("plan", request_id=new_request_id("plan"), commit=commit, arguments=arguments)
     return 0, {"ok": True, "scope": "server plan; nothing was changed", **response["result"]}
 
@@ -282,7 +299,7 @@ def application_logs(client: HelperClient, tail: int) -> tuple[int, dict]:
 def run_job_command(manifest: dict, client: HelperClient, action: str, *, request_id: str | None = None,
                     on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
     request_id = request_id or new_request_id(action)
-    outcome = submit_and_wait(client, action, request_id=request_id, timeout=manifest["deploy"]["readiness_timeout_seconds"] + 900,
+    outcome = submit_and_wait(client, action, request_id=request_id, timeout=job_timeout(manifest),
                               on_progress=on_progress)
     return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
                                   "exit_code": outcome["exit_code"], **outcome["detail"]}

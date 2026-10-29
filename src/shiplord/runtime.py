@@ -11,11 +11,13 @@ import hashlib
 import json
 import platform
 import shutil
+import time
 from pathlib import Path
 from typing import Protocol
 
 from .environment import EnvironmentError_, load_environment_file
 from .layout import Layout
+from .shutdown import DEFAULT_ACTION, DEFAULT_TIMEOUT_SECONDS, FORCE_EXIT_SECONDS, policy
 from .storage import container_path
 from .system import CommandError, System
 
@@ -33,10 +35,13 @@ _MACHINE_PLATFORMS = {"x86_64": "linux/amd64", "amd64": "linux/amd64", "aarch64"
 class RuntimeFailure(Exception):
     """A runtime step failed; ``phase`` names it and ``detail`` is capped, sanitized output."""
 
-    def __init__(self, message: str, phase: str, detail: str = ""):
+    def __init__(self, message: str, phase: str, detail: str = "", *, intervention_required: bool = False,
+                 kind: str = ""):
         super().__init__(message)
         self.phase = phase
         self.detail = detail
+        self.intervention_required = intervention_required  # the process may still be running: nothing may restart it
+        self.kind = kind
 
 
 def release_id(release: dict) -> str:
@@ -45,6 +50,24 @@ def release_id(release: dict) -> str:
     identity = artifact.get("image") or artifact.get("sha256")
     payload = json.dumps([release["commit"], identity, release["sequence"]], separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
+_SIGNALS = {"HUP": 1, "INT": 2, "QUIT": 3, "USR1": 10, "USR2": 12, "TERM": 15, "ALRM": 14, "WINCH": 28}
+_UNCATCHABLE = {9, 19}  # SIGKILL and SIGSTOP cannot be handled, so they are not a graceful stop
+POLL_SECONDS = 0.5
+
+
+def stop_signal(configured: str) -> str:
+    """Validate a container's stop signal (empty means SIGTERM); only catchable signals qualify as graceful."""
+    text = configured.strip()
+    if text in ("", "<no value>"):
+        return "SIGTERM"
+    name = text[3:] if text.upper().startswith("SIG") else text
+    if name.isdigit() and 1 <= int(name) <= 31 and int(name) not in _UNCATCHABLE:
+        return name
+    if name.upper() in _SIGNALS:
+        return "SIG" + name.upper()
+    raise RuntimeFailure("the container's stop signal is not one that a process can handle gracefully", "stop")
 
 
 def _digest(image: str) -> str:
@@ -64,8 +87,11 @@ class Runtime(Protocol):
 class DockerRuntime:
     """Docker via the CLI. The server's platform is derived from the host unless given."""
 
-    def __init__(self, system: System, layout: Layout, *, platform_name: str | None = None):
+    def __init__(self, system: System, layout: Layout, *, platform_name: str | None = None,
+                 clock=time.monotonic, sleep=time.sleep):
         self.system, self.layout = system, layout
+        self.clock, self.sleep = clock, sleep
+        self.stop_report: list[dict] = []  # what stopping did: stages, elapsed time, policy, whether force was needed
         self.platform = platform_name or _MACHINE_PLATFORMS.get(platform.machine().lower(), "linux/amd64")
 
     # naming ---------------------------------------------------------------
@@ -137,19 +163,130 @@ class DockerRuntime:
         if driver != "local" or options or not isinstance(labels, dict) or labels.get("shiplord.app", registration["application_id"]) != registration["application_id"]:
             raise RuntimeFailure("the application volume does not match what Shiplord manages; nothing was changed", "storage")
 
-    def _remove_containers(self, registration: dict) -> None:
+    def _container_ids(self, registration: dict, phase: str = "stop") -> list[str]:
         listing = self._docker(["ps", "-aq", "--no-trunc", "--filter", f"label=shiplord.app={registration['application_id']}"],
-                               "stop")
+                               phase)
         if listing.code != 0:
-            raise RuntimeFailure("existing containers could not be listed", "stop", listing.output)
+            raise RuntimeFailure("existing containers could not be listed", phase, listing.output)
         identifiers = listing.output.split()
         for identifier in identifiers:
             if len(identifier) != 64 or not all(c in "0123456789abcdef" for c in identifier):
-                raise RuntimeFailure("unexpected container listing", "stop")
-        if identifiers:
-            removal = self._docker(["rm", "--force", *identifiers], "stop")  # no -v: named volumes persist
-            if removal.code != 0:
-                raise RuntimeFailure("existing containers could not be removed", "stop", removal.output)
+                raise RuntimeFailure("unexpected container listing", phase)
+        return identifiers
+
+    _INSPECT = ("{{.State.Status}} {{.HostConfig.RestartPolicy.Name}} {{.Config.StopSignal}}"
+                "|{{index .Config.Labels \"shiplord.shutdown_timeout\"}}|{{index .Config.Labels \"shiplord.shutdown_action\"}}")
+
+    def _outgoing(self, identifier: str) -> dict:
+        result = self._docker(["inspect", "--format", self._INSPECT, identifier], "stop")
+        if result.code != 0:
+            raise RuntimeFailure("an existing container could not be inspected", "stop", result.output)
+        try:
+            head, timeout, action = result.output.strip().split("|")
+            status, restart, *signal = head.split(" ", 2)
+            signal = signal[0] if signal else ""
+            if status not in ("created", "running", "paused", "restarting", "removing", "exited", "dead"):
+                raise ValueError
+        except ValueError:
+            raise RuntimeFailure("an existing container reported unusable shutdown metadata", "stop") from None
+        absent = ("<no value>", "")
+        if timeout in absent and action in absent:  # a container from before the policy existed
+            timeout, action = str(DEFAULT_TIMEOUT_SECONDS), DEFAULT_ACTION
+        if not (timeout.isdigit() and 1 <= int(timeout) <= 300 and action in ("force", "fail")):
+            raise RuntimeFailure("an existing container reported unusable shutdown metadata", "stop")
+        return {"id": identifier, "status": status, "restart_policy": restart, "signal": signal,
+                "timeout": int(timeout), "action": action}
+
+    def _state(self, identifier: str) -> str:
+        result = self._docker(["inspect", "--format", "{{.State.Status}}", identifier], "stop")
+        if result.code != 0:
+            if "no such" in result.output.lower():
+                return "gone"
+            raise RuntimeFailure("an existing container could not be inspected", "stop", result.output)
+        return result.output.strip()
+
+    def _wait_exit(self, identifier: str, seconds: float) -> bool:
+        deadline = self.clock() + seconds
+        while True:
+            if self._state(identifier) in ("exited", "dead", "created", "gone"):
+                return True
+            if self.clock() >= deadline:
+                return False
+            self.sleep(POLL_SECONDS)
+
+    def _remove(self, identifier: str) -> None:
+        removal = self._docker(["rm", identifier], "stop")  # no --force, no -v: only a stopped container; volumes persist
+        if removal.code != 0 and self._state(identifier) != "gone":
+            raise RuntimeFailure("a stopped container could not be removed", "stop", removal.output)
+
+    def stop_in_progress(self, registration: dict) -> bool:
+        """Is a container still draining after a stop attempt? Containers are created with a restart policy, and the
+        stop attempt turns it off before signalling, so a live container without one is mid-shutdown."""
+        for identifier in self._container_ids(registration, "inspect"):
+            info = self._outgoing(identifier)
+            if info["status"] in ("running", "paused", "restarting") and info["restart_policy"] == "no":
+                return True
+        return False
+
+    def _remove_containers(self, registration: dict) -> None:
+        """Gracefully stop whatever runs for the application (under its own recorded policy), then remove it."""
+        self.stop_report = []
+        outgoing = [self._outgoing(identifier) for identifier in self._container_ids(registration)]
+        live = [c for c in outgoing if c["status"] in ("running", "paused", "restarting")]
+        if len(live) > 1:  # nothing is signalled while it is unclear which process is the application
+            raise RuntimeFailure("more than one container is running for this application", "stop",
+                                 intervention_required=True, kind="ambiguous")
+        for container in outgoing:
+            if container["status"] in ("running", "paused", "restarting"):
+                self._stop_gracefully(container)
+            self._remove(container["id"])
+
+    def _stop_gracefully(self, container: dict) -> None:
+        identifier, started = container["id"], self.clock()
+        report = {"timeout_seconds": container["timeout"], "action": container["action"], "stages": ["stop_requested"],
+                  "forced": False}
+        self.stop_report.append(report)
+        signal = stop_signal(container["signal"])  # validated before anything is changed or sent
+        if container["status"] == "paused":
+            raise RuntimeFailure("the container is paused and cannot handle a shutdown signal", "stop",
+                                 intervention_required=True, kind="paused")
+        if container["restart_policy"] != "no":
+            update = self._docker(["update", "--restart=no", identifier], "stop")  # first: nothing may restart it
+            if update.code != 0:
+                raise RuntimeFailure("the container's restart policy could not be disabled", "stop", update.output)
+            sent = self._docker(["kill", "--signal", signal, identifier], "stop")
+            if sent.code != 0 and self._state(identifier) not in ("exited", "dead", "gone"):
+                raise RuntimeFailure("the shutdown signal could not be sent", "stop", sent.output)
+            report["stages"].append("signalled")
+        elif container["action"] == "fail":  # a previous worker already signalled it: never signal again, never kill
+            if self._state(identifier) in ("exited", "dead", "gone"):
+                report["stages"].append("exited")
+                return
+            self._expired(container, report, started)
+        # The original deadline is not persisted, so a continuing attempt waits a full period without re-signalling.
+        report["stages"].append("waiting")
+        if self._wait_exit(identifier, container["timeout"]):
+            report["stages"].append("exited")
+            report["elapsed_seconds"] = round(self.clock() - started, 1)
+            return
+        if container["action"] == "fail":
+            self._expired(container, report, started)
+        killed = self._docker(["kill", "--signal", "KILL", identifier], "stop")
+        if killed.code != 0 and self._state(identifier) not in ("exited", "dead", "gone"):
+            raise RuntimeFailure("the container could not be killed after its shutdown deadline", "stop", killed.output)
+        report["forced"] = True
+        report["stages"].append("forced")
+        if not self._wait_exit(identifier, FORCE_EXIT_SECONDS):
+            raise RuntimeFailure("the container did not exit after being killed", "stop", intervention_required=True,
+                                 kind="kill_unconfirmed")
+        report["elapsed_seconds"] = round(self.clock() - started, 1)
+
+    def _expired(self, container: dict, report: dict, started: float) -> None:
+        report["stages"].append("deadline_expired")
+        report["elapsed_seconds"] = round(self.clock() - started, 1)
+        raise RuntimeFailure(f"the application did not stop within {container['timeout']} seconds and its policy is not "
+                             "to force it; it was signalled and may still exit. Run `shiplord recover` once it has",
+                             "stop", intervention_required=True, kind="shutdown_timeout")
 
     def stop(self, registration: dict) -> None:
         self._remove_containers(registration)
@@ -164,13 +301,15 @@ class DockerRuntime:
             raise RuntimeFailure(f"the environment file is unusable: {error}", "start") from None
         self.check_volume(registration, create=True)  # before the running release is touched
         self._remove_containers(registration)
+        timeout, action = policy(config)
         memory = f"{config['resources']['memory_mb']}m"
         argv = ["run", "--detach", "--name", self.container_name(registration, release),
                 "--label", f"shiplord.app={registration['application_id']}",
                 "--label", f"shiplord.release={release_id(release)}",
+                "--label", f"shiplord.shutdown_timeout={timeout}", "--label", f"shiplord.shutdown_action={action}",
                 "--restart", "unless-stopped", "--memory", memory, "--memory-swap", memory, "--pids-limit", "512",
                 "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
-                "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "--stop-timeout", "10",
+                "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "--stop-timeout", str(timeout),
                 "--publish", f"127.0.0.1:{registration['host_port']}:{http['container_port']}",
                 "--volume", f"{self.volume_name(registration)}:{container_path(config)}"]
         if custom is not None:
