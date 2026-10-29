@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from shiplord import github  # noqa: E402
 from shiplord.client import ClientError  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
-from shiplord.github import (SECRET_NAME, GhResult, GitHub, GitHubError, fetch_host_keys, generate_ci_key,  # noqa: E402
+from shiplord.github import (SECRET_NAME, GhResult, GitHub, GitHubError, check_ci, fetch_host_keys, generate_ci_key,  # noqa: E402
                              github_setup, github_status, known_hosts_lines, label_for, parse_host_key, resolve_ssh_host,
                              rotate_key)
 from shiplord.keys import parse_public_key  # noqa: E402
@@ -67,6 +67,10 @@ class FakeGh:
     def __init__(self):
         self.calls, self.secrets, self.variables_, self.fail, self.permission = [], {}, {}, set(), "ADMIN"
         self.run = None
+        self.oidc = {"use_default": True}
+        self.dispatched = [{"databaseId": 7, "status": "completed", "url": "old"}]
+        self.dispatch_error = None
+        self.views = []
 
     def __call__(self, argv, stdin=None):
         self.calls.append((list(argv), stdin))
@@ -75,6 +79,8 @@ class FakeGh:
             return GhResult(1, "", f"{key} failed")
         if argv[:2] == ["api", "user"]:
             return GhResult(0, "octocat\n", "")
+        if argv[0] == "api" and argv[1].endswith("/actions/oidc/customization/sub"):
+            return GhResult(0, json.dumps(self.oidc), "")
         if argv[:2] == ["repo", "view"]:
             return GhResult(0, json.dumps({"viewerPermission": self.permission}), "")
         if argv[:2] == ["secret", "set"]:
@@ -87,8 +93,17 @@ class FakeGh:
             return GhResult(0, json.dumps([{"name": n} for n in self.secrets]), "")
         if argv[:2] == ["variable", "list"]:
             return GhResult(0, json.dumps([{"name": n, "value": v} for n, v in self.variables_.items()]), "")
+        if argv[:2] == ["run", "list"] and "workflow_dispatch" in argv:
+            return GhResult(0, json.dumps(self.dispatched), "")
         if argv[:2] == ["run", "list"]:
             return GhResult(0, json.dumps([self.run] if self.run else []), "")
+        if argv[:2] == ["workflow", "run"]:
+            if self.dispatch_error:
+                return GhResult(1, "", self.dispatch_error)
+            self.dispatched.insert(0, {"databaseId": 99, "status": "queued", "url": "https://github.com/run/99"})
+            return GhResult(0, "", "")
+        if argv[:2] == ["run", "view"]:
+            return GhResult(0, json.dumps(self.views.pop(0) if len(self.views) > 1 else self.views[0]), "")
         raise AssertionError(argv)
 
     def order(self):
@@ -331,6 +346,29 @@ class SetupTests(GitHubTestCase):
         native = " ".join(self.setup_call(manifest=manifest("native"))["remaining"])
         self.assertNotIn("registry login", native)
 
+    def test_without_tailscale_settings_the_result_carries_the_exact_subject_for_immutable_subjects(self):
+        self.gh_runner.oidc = {"use_default": True, "use_immutable_subject": True,
+                               "sub_claim_prefix": "repo:Example@11/orders@22"}
+        setup = self.setup_call()["tailscale_setup"]
+        self.assertEqual(setup["subject_repository"], "repo:Example@11/orders@22:ref:refs/heads/main")
+        self.assertEqual(setup["subject_all_repositories"], "repo:Example@11/*:ref:refs/heads/main")
+        self.assertIn(setup["subject_all_repositories"], " ".join(setup["steps"]))
+
+    def test_the_classic_subject_is_used_when_github_reports_no_prefix_or_cannot_be_read(self):
+        self.assertEqual(self.setup_call()["tailscale_setup"]["subject_repository"],
+                         "repo:Example/orders:ref:refs/heads/main")
+        self.gh_runner.fail.add("api repos/Example/orders/actions/oidc/customization/sub")
+        self.assertEqual(self.setup_call()["tailscale_setup"]["subject_all_repositories"],
+                         "repo:Example/*:ref:refs/heads/main")
+
+    def test_a_customized_subject_template_is_flagged(self):
+        self.gh_runner.oidc = {"use_default": False, "include_claim_keys": ["repo", "context"]}
+        self.assertIn("customized", self.setup_call()["tailscale_setup"]["warning"])
+
+    def test_no_guidance_is_added_when_tailscale_is_configured(self):
+        result = self.setup_call(tailscale={"SHIPLORD_TS_CLIENT_ID": "id123456", "SHIPLORD_TS_AUDIENCE": "aud"})
+        self.assertNotIn("tailscale_setup", result)
+
     def test_the_remaining_manual_steps_are_stated_and_no_run_is_claimed(self):
         text = " ".join(self.setup_call()["remaining"])
         self.assertIn("Tailscale", text)
@@ -497,3 +535,75 @@ class KeyGenerationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def check_view(conclusion="success", failed=None):
+    names = ["Install the pinned Shiplord", "Join the tailnet", "Prepare the SSH identity and pinned host keys",
+             "Check access only", "Deploy"]
+    steps, seen = [], False
+    for name in names:
+        if name == "Deploy":
+            state = "skipped"
+        elif seen:
+            state = "skipped"
+        elif name == failed:
+            state, seen = "failure", True
+        else:
+            state = "success"
+        steps.append({"name": name, "conclusion": state})
+    return {"status": "completed", "conclusion": conclusion, "url": "https://github.com/run/99",
+            "jobs": [{"name": "quality", "steps": []}, {"name": "deploy", "steps": steps}]}
+
+
+class CheckCiTests(unittest.TestCase):
+    def setUp(self):
+        self.gh_runner = FakeGh()
+        self.gh = GitHub(self.gh_runner)
+        self.slept = []
+        self.now = [0.0]
+
+    def check(self, timeout=1200):
+        def sleep(seconds):
+            self.slept.append(seconds)
+            self.now[0] += seconds
+        return check_ci(manifest(with_github=True), gh=self.gh, timeout=timeout, clock=lambda: self.now[0], sleep=sleep)
+
+    def test_a_check_dispatches_check_only_on_the_deployment_branch_and_waits_for_the_new_run(self):
+        self.gh_runner.views = [{"status": "in_progress"}, check_view()]
+        code, result = self.check()
+        self.assertEqual((code, result["ok"], result["run"]), (0, True, "https://github.com/run/99"))
+        dispatch = next(a for a, _ in self.gh_runner.calls if a[:2] == ["workflow", "run"])
+        self.assertEqual(dispatch[dispatch.index("--ref") + 1], "main")
+        self.assertIn("check_only=true", dispatch)
+        self.assertEqual(result["steps"]["Deploy"], "skipped")
+        self.assertEqual(self.slept, [10])
+
+    def test_a_tailscale_refusal_names_the_subject_github_presents(self):
+        self.gh_runner.oidc = {"use_default": True, "sub_claim_prefix": "repo:Example@1/orders@2"}
+        self.gh_runner.views = [check_view("failure", "Join the tailnet")]
+        code, result = self.check()
+        self.assertEqual((code, result["failed_step"]), (1, "Join the tailnet"))
+        self.assertEqual(result["subject_expected"], "repo:Example@1/orders@2:ref:refs/heads/main")
+        self.assertIn("subject", result["hint"])
+
+    def test_an_ssh_refusal_points_at_the_ci_key(self):
+        self.gh_runner.views = [check_view("failure", "Check access only")]
+        code, result = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn("github status --check-server", result["hint"])
+        self.assertNotIn("subject_expected", result)
+
+    def test_a_workflow_without_the_check_mode_asks_for_regeneration(self):
+        self.gh_runner.dispatch_error = "could not create workflow dispatch event: HTTP 422: Unexpected inputs provided"
+        with self.assertRaisesRegex(GitHubError, "force-workflow"):
+            self.check()
+
+    def test_a_run_that_does_not_finish_is_reported_without_claiming_success(self):
+        self.gh_runner.views = [{"status": "in_progress", "url": "u"}]
+        code, result = self.check(timeout=30)
+        self.assertEqual((code, result["ok"], result["status"]), (1, False, "in_progress"))
+
+    def test_without_a_github_section_nothing_is_dispatched(self):
+        with self.assertRaises(GitHubError):
+            check_ci(manifest(), gh=self.gh)
+        self.assertEqual(self.gh_runner.calls, [])

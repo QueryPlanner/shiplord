@@ -69,7 +69,17 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.data["concurrency"], {"group": "shiplord-release-orders", "cancel-in-progress": False})
         for name in ("build", "deploy"):
             self.assertIn("timeout-minutes", self.jobs[name])
-        self.assertEqual(self.jobs["deploy"]["if"], "${{ github.ref == \"refs/heads/main\" }}")
+        self.assertEqual(self.jobs["deploy"]["if"], "${{ !cancelled() && github.ref == \"refs/heads/main\" && "
+                                                    "(inputs.check_only || needs.build.result == 'success') }}")
+
+    def test_a_check_only_dispatch_skips_quality_and_build_and_runs_status_instead_of_deploy(self):
+        trigger = self.data.get("on") or self.data["true"]
+        self.assertEqual(trigger["workflow_dispatch"]["inputs"]["check_only"]["default"], False)
+        self.assertEqual(self.jobs["quality"]["if"], "${{ !inputs.check_only }}")  # build needs quality: skipped too
+        steps = {s.get("name"): s for s in self.steps("deploy")}
+        self.assertEqual((steps["Check access only"]["if"], steps["Check access only"]["run"]),
+                         ("${{ inputs.check_only }}", "shiplord status --json"))
+        self.assertEqual(steps["Deploy"]["if"], "${{ !inputs.check_only }}")
 
     def test_no_secret_variable_or_event_value_is_interpolated_into_a_shell_script(self):
         for job in self.jobs.values():
@@ -125,7 +135,7 @@ class WorkflowTests(unittest.TestCase):
         other = manifest(github={"repository": "Example/orders", "deployment_branch": "release/prod"})
         data = parse(render_workflow(other, tooling_ref=REF))
         self.assertEqual((data.get("on") or data["true"])["push"]["branches"], ["release/prod"])
-        self.assertEqual(data["jobs"]["deploy"]["if"], "${{ github.ref == \"refs/heads/release/prod\" }}")
+        self.assertIn("github.ref == \"refs/heads/release/prod\"", data["jobs"]["deploy"]["if"])
 
     def test_invalid_inputs_are_refused(self):
         for kwargs in ({"tooling_ref": "main"}, {"tooling_ref": REF[:-1]}, {"tooling_ref": REF, "platforms": "linux/386"},

@@ -52,6 +52,11 @@ on:
   push:
     branches: [{quote(branch)}]
   workflow_dispatch:
+    inputs:
+      check_only:
+        description: Check CI access only (Tailscale, SSH, helper); build and deploy nothing
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -63,6 +68,7 @@ concurrency:
 
 jobs:
   quality:
+    if: ${{{{ !inputs.check_only }}}}
     permissions:
       contents: read
       id-token: write
@@ -111,7 +117,8 @@ jobs:
 
   deploy:
     needs: build
-    if: ${{{{ github.ref == {quote("refs/heads/" + branch)} }}}}
+    # Runs after a successful build, or alone for a check-only dispatch (which skips the build).
+    if: ${{{{ !cancelled() && github.ref == {quote("refs/heads/" + branch)} && (inputs.check_only || needs.build.result == 'success') }}}}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -155,7 +162,11 @@ jobs:
             echo "SHIPLORD_SSH_TARGET=${{DEPLOY_USER}}@${{SERVER_HOST}}"
             if [ -n "$SSH_PORT" ]; then echo "SHIPLORD_SSH_PORT=$SSH_PORT"; fi
           }} >> "$GITHUB_ENV"
+      - name: Check access only
+        if: ${{{{ inputs.check_only }}}}
+        run: shiplord status --json
       - name: Deploy
+        if: ${{{{ !inputs.check_only }}}}
         env:
           IMAGE: ${{{{ needs.build.outputs.image }}}}
           DIGEST: ${{{{ needs.build.outputs.digest }}}}

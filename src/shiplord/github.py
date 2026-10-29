@@ -17,10 +17,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
+from . import tailscale
 from .client import AdminClient, ClientError, HelperClient, run_ssh
 from .keys import KeyError_, parse_public_key
 from .layout import deployment_user
@@ -100,6 +102,41 @@ class GitHub:
     def variables(self, repository: str) -> dict[str, str]:
         output = self._run(["variable", "list", "--repo", repository, "--json", "name,value"], what="variable list").stdout
         return {item["name"]: item["value"] for item in json.loads(output or "[]")}
+
+    def oidc_subject_prefix(self, repository: str) -> tuple[str, list[str]]:
+        """GitHub's OIDC subject prefix for the repository and any customized claim keys.
+
+        Repositories created with immutable subjects use ``repo:Owner@<id>/name@<id>`` instead of the names alone.
+        """
+        result = self.runner(["api", f"repos/{repository}/actions/oidc/customization/sub"], None)
+        try:
+            data = json.loads(result.stdout) if result.code == 0 else {}
+        except ValueError:
+            data = {}
+        prefix = data.get("sub_claim_prefix") if isinstance(data.get("sub_claim_prefix"), str) else None
+        custom = [] if data.get("use_default", True) else [str(key) for key in data.get("include_claim_keys") or []]
+        return prefix or f"repo:{repository}", custom
+
+    def dispatch_runs(self, repository: str, branch: str) -> list[dict]:
+        output = self._run(["run", "list", "--repo", repository, "--workflow", Path(WORKFLOW_PATH).name, "--event",
+                            "workflow_dispatch", "--branch", branch, "--limit", "10", "--json", "databaseId,status,url"],
+                           what="run list").stdout
+        return json.loads(output or "[]")
+
+    def dispatch_check(self, repository: str, branch: str) -> None:
+        result = self.runner(["workflow", "run", Path(WORKFLOW_PATH).name, "--repo", repository, "--ref", branch,
+                              "-f", "check_only=true"], None)
+        if result.code != 0:
+            detail = result.stderr.strip()[:200]
+            if "check_only" in detail or "nexpected input" in detail:
+                raise GitHubError("the workflow has no check-only mode yet; regenerate it with `shiplord github setup "
+                                  "--force-workflow` and push it", 2, "dispatch")
+            raise GitHubError(f"GitHub could not start the workflow: {detail or 'no details'}", 3, "dispatch")
+
+    def run_view(self, repository: str, run_id: int) -> dict:
+        output = self._run(["run", "view", str(run_id), "--repo", repository, "--json", "status,conclusion,url,jobs"],
+                           what="run view").stdout
+        return json.loads(output or "{}")
 
     def last_run(self, repository: str) -> dict | None:
         output = self._run(["run", "list", "--repo", repository, "--workflow", Path(WORKFLOW_PATH).name, "--limit", "1",
@@ -297,11 +334,13 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
     _ensure_manifest_github(project, manifest, repository)
     steps["manifest"] = f"ship.toml names {repository}"
     remaining = []
+    extra: dict = {}
     if not (tailscale and tailscale.get("SHIPLORD_TS_CLIENT_ID")):
         steps["tailscale"] = "not configured"
-        remaining.append("Create the Tailscale workload-identity federation for this repository and grant tag:ci access "
-                         "to the server's SSH port, then rerun with --tailscale-client-id and --tailscale-audience "
-                         "(Shiplord cannot do this without Tailscale administrative credentials).")
+        extra["tailscale_setup"] = tailscale_guidance(gh, repository, manifest)
+        remaining.append("Create the Tailscale trust credential as described in tailscale_setup, then rerun with "
+                         "--tailscale-client-id and --tailscale-audience (Shiplord cannot do this without Tailscale "
+                         "administrative credentials).")
     else:
         remaining.append("Make sure the Tailscale trust credential gives tag:ci and that tag:ci may reach the server's "
                          "SSH port; Shiplord cannot check the tailnet policy.")
@@ -309,7 +348,18 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
         remaining.append("Give the server a read-only pull credential if the image is private: `shiplord registry login`.")
     remaining.append("No GitHub Actions run has been performed: nothing here claims the pipeline works until one succeeds.")
     return {"ok": True, "repository": repository, "github_account": account, "key_label": state["label"],
-            "key_fingerprint": state["fingerprint"], "server_host": server_host, "steps": steps, "remaining": remaining}
+            "key_fingerprint": state["fingerprint"], "server_host": server_host, "steps": steps, "remaining": remaining,
+            **extra}
+
+
+def tailscale_guidance(gh: GitHub, repository: str, manifest: dict) -> dict:
+    """Instructions for the Tailscale trust credential, with the exact subject this repository's runs present."""
+    branch = manifest.get("github", {}).get("deployment_branch", "main")
+    prefix, custom = gh.oidc_subject_prefix(repository)
+    try:
+        return tailscale.guidance(prefix, branch, custom_claims=custom)
+    except tailscale.TailscaleError as error:
+        raise GitHubError(str(error), 3, "tailscale") from None
 
 
 def _write_workflow(manifest: dict, repository: str, project: Path, state: dict, directory: Path,
@@ -426,7 +476,8 @@ def github_status(manifest: dict, *, project: Path, gh: GitHub, admin: AdminClie
                            "deploy_user_matches": variables.get("SHIPLORD_DEPLOY_USER") == deployment_user(app)}
     checks["variables"]["ok"] = checks["variables"]["ok"] and checks["variables"]["deploy_user_matches"]
     checks["tailscale"] = {"ok": all(variables.get(name) for name in TAILSCALE_VARIABLES[:2]),
-                           "hint": "set SHIPLORD_TS_CLIENT_ID and SHIPLORD_TS_AUDIENCE after creating the federation"}
+                           "hint": "rerun `shiplord github setup` for step-by-step Tailscale instructions with this "
+                                   "repository's exact OIDC subject"}
     workflow = project / WORKFLOW_PATH
     unmodified = workflow.exists() and hashlib.sha256(workflow.read_bytes()).hexdigest() == state.get("workflow_sha256")
     checks["workflow"] = {"ok": workflow.exists(), "unmodified_since_generation": unmodified}
@@ -439,3 +490,51 @@ def github_status(manifest: dict, *, project: Path, gh: GitHub, admin: AdminClie
                           "note": None if run else "no workflow run has happened yet"}
     ok = all(check["ok"] for check in checks.values())
     return (0 if ok else 3), {"ok": ok, "repository": repository, "checks": checks}
+
+
+CHECK_HINTS = {
+    "Install the pinned Shiplord": "the runner could not install Shiplord at the pinned commit; check that it is pushed",
+    "Join the tailnet": "Tailscale refused the runner, or the server did not answer its ping: compare the trust "
+                        "credential's subject with subject_expected, and check tag:ci in the tailnet policy",
+    "Prepare the SSH identity and pinned host keys": "the CI secret or variables are missing; run `shiplord github setup`",
+    "Check access only": "the CI key, host keys or helper were refused; run `shiplord github status --check-server`",
+}
+
+
+def check_ci(manifest: dict, *, gh: GitHub, timeout: float = 1200, clock: Callable[[], float] = time.monotonic,
+             sleep: Callable[[float], None] = time.sleep) -> tuple[int, dict]:
+    """Start a check-only run of the release workflow and report each step, without building or deploying."""
+    if "github" not in manifest:
+        raise GitHubError("ship.toml has no [github] section; run `shiplord github setup --repo owner/name`", 2)
+    repository = manifest["github"]["repository"]
+    branch = manifest["github"].get("deployment_branch", "main")
+    before = {run["databaseId"] for run in gh.dispatch_runs(repository, branch)}
+    gh.dispatch_check(repository, branch)
+    deadline = clock() + timeout
+    run_id = None
+    while run_id is None:
+        run_id = next((run["databaseId"] for run in gh.dispatch_runs(repository, branch) if run["databaseId"] not in before),
+                      None)
+        if run_id is None:
+            if clock() >= deadline:
+                raise GitHubError("GitHub did not start the check run in time", 1, "dispatch")
+            sleep(3)
+    while True:
+        run = gh.run_view(repository, run_id)
+        if run.get("status") == "completed":
+            break
+        if clock() >= deadline:
+            return 1, {"ok": False, "run": run.get("url"), "status": run.get("status"),
+                       "error": "the check run did not finish in time; it is still running on GitHub"}
+        sleep(10)
+    deploy = next((job for job in run.get("jobs") or [] if job.get("name") == "deploy"), {})
+    steps = {step["name"]: step.get("conclusion") for step in deploy.get("steps") or []}
+    failed = next((name for name, conclusion in steps.items() if conclusion == "failure"), None)
+    ok = run.get("conclusion") == "success" and steps.get("Check access only") == "success"
+    result = {"ok": ok, "run": run.get("url"), "conclusion": run.get("conclusion"), "steps": steps}
+    if not ok:
+        result["failed_step"] = failed
+        result["hint"] = CHECK_HINTS.get(failed or "", "read the run log on GitHub")
+        if failed == "Join the tailnet":
+            result["subject_expected"] = tailscale_guidance(gh, repository, manifest)["subject_repository"]
+    return (0 if ok else 1), result

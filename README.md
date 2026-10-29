@@ -17,9 +17,9 @@ Built and verified (see [docs/evidence.md](docs/evidence.md) for what ran, where
 - Docker and native-binary deployment, readiness and routing checks, rollback, recovery, status, logs, plan.
 - Caddy route transactions with validate-before-publish and restore on failure.
 
-Not verified, because it needs access this repository does not have: installation on your production server,
-the Tailscale trust configuration, and a live GitHub-hosted run. Those are called out in
-[docs/evidence.md](docs/evidence.md) and are the only unchecked items in the plan's Definition of Done.
+Also run on a real Hetzner server (Ubuntu, x86-64, behind Cloudflare): native deploys, rollback, a failed release
+restored automatically, Let's Encrypt HTTPS, and a release deployed by GitHub Actions through Tailscale OIDC. Not
+verified: the plan's controlled install on *your* production server (§12E). See [docs/evidence.md](docs/evidence.md).
 
 ## Install the CLI
 
@@ -88,7 +88,8 @@ systemd unit.
 
 ```sh
 shiplord github setup --repo owner/orders --tooling-ref <commit of Shiplord pushed to GitHub>
-git add .github/workflows/shiplord-release.yml ship.toml && git commit
+git add .github/workflows/shiplord-release.yml ship.toml && git commit   # merge to the deployment branch
+shiplord github check-ci            # joins Tailscale and logs in with the CI key; builds and deploys nothing
 shiplord github status --check-server
 shiplord github rotate-key
 ```
@@ -100,9 +101,13 @@ stdin) and sets the `SHIPLORD_*` repository variables. It then writes `.github/w
 the template's quality checks, an image build, and `shiplord deploy` by digest from a runner joined to your tailnet.
 It is resumable, keeps the private key only until GitHub has it, and never uploads your personal key.
 
-Two things stay with you because they need authority Shiplord does not have: the **Tailscale workload-identity
-federation** (set `SHIPLORD_TS_CLIENT_ID` and `SHIPLORD_TS_AUDIENCE`; pass them with `--tailscale-client-id` and
-`--tailscale-audience`) and **DNS**. The generated workflow pins every action to a commit, never cancels a running
+Two things stay with you because they need authority Shiplord does not have: the **Tailscale trust credential** and
+**DNS**. For Tailscale, `github setup` guides you instead: it reads the OIDC subject GitHub will actually present (repositories
+with immutable subjects use `repo:Owner@<id>/name@<id>`, not the plain names), prints the policy line and the
+credential settings with every value filled in, asks for the client ID and audience (not secrets), checks they belong
+together, and saves them so the next application's setup does not ask again. Use the owner-wide subject it suggests,
+`repo:Owner@<id>/*:ref:refs/heads/main`, to do this once for every repository. `--tailscale-client-id` and
+`--tailscale-audience` skip the prompt. `github check-ci` then proves the whole path with a check-only run. The generated workflow pins every action to a commit, never cancels a running
 production deploy, and gives `id-token: write` only to the jobs that need it. `rotate-key` adds and proves a new key,
 updates GitHub, and only then revokes the old one.
 
@@ -123,7 +128,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. |
 | `rollback`, `recover` | Restore the previous release; reconcile an interrupted deployment. |
 | `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
-| `github setup --repo R` / `status [--check-server]` / `rotate-key` | CI key, repository secret and variables, release workflow. |
+| `github setup --repo R` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |
 | `doctor --local \| --server <alias> [--deep] \| (in an app directory)` | Prerequisites; helper probe (`--deep`: Caddy, sshd, Docker, disk, each application); access, helper, DNS. |
 
 Every command that reports a result accepts `--json`. No output contains private keys, secret values, or complete

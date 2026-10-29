@@ -9,8 +9,8 @@ State of the tree when this was written: the working tree on `main`, uncommitted
 
 | Where | Command | Result |
 | --- | --- | --- |
-| macOS (arm64), Python 3.14 | `python -m unittest discover -s tests` | 584 run, OK, 60 skipped (real-host suites) |
-| Linux container (Ubuntu 24.04), integration as root + full suite as an unprivileged user | `tests/linux/run.sh unit` | 584 run as an unprivileged user, OK (73 skipped); sudo/sshd integration 8/8 as root |
+| macOS (arm64), Python 3.14 | `python -m unittest discover -s tests` | 611 run, OK, 60 skipped (real-host suites) |
+| Linux container (Ubuntu 24.04), integration as root + full suite as an unprivileged user | `tests/linux/run.sh unit` | 611 run as an unprivileged user, OK (74 skipped); sudo/sshd integration 8/8 as root |
 | Real Caddy 2.11.7: route transactions, reload, live HTTPS traffic through Caddy's local CA | `tests/linux/run.sh caddy` | 5/5 passed |
 | Real sshd, sudo, useradd, visudo: bootstrap, provisioning, the SSH forced-command path | `tests/linux/run.sh host` | 9/9 passed |
 | Real Docker daemon and registry: the deploy engine, rollback, recovery, retention | `tests/linux/run.sh docker` | 1/1 passed (full deploy/rollback/recovery/retention lifecycle) |
@@ -37,8 +37,8 @@ runners were **not** used; `.github/workflows/test.yml` defines the correspondin
 | Successful deployments report commit, artifact, URL, readiness | Verified | `release`, `probes` and `url` in the deploy result (`test_commands`, e2e 07). |
 | Logs, status, explicit rollback, interrupted-job recovery | Verified | e2e 07/12/13, systemd 09-11 (client dies; worker is `SIGKILL`ed; `recover` restores). |
 | Failed releases return nonzero and preserve or restore the last good release | Verified | Docker lifecycle and e2e 09 (exit 5); systemd 06/07 (including a kernel OOM kill). |
-| CI key creation, repository configuration, safe rotation | Verified against a stand-in `gh` | `test_github`; e2e 16-20 against the real server: setup, CI-only credentials operating the application, wrong host key failing closed, rotation revoking the old key. The real `gh` and GitHub were **not** used. |
-| A real GitHub push completes the full path through Tailscale/OpenSSH | **Not verified** | Needs your repository, runner, and Tailscale federation. The workflow is generated and structurally tested; no GitHub run has happened. |
+| CI key creation, repository configuration, safe rotation | Setup verified with the real `gh` and GitHub; rotation against a stand-in `gh` | Real server run below: `github setup` against a private repository (secret, variables, key proven over Tailscale SSH). `test_github`; e2e 16-20 for wrong host keys and rotation. |
+| A real GitHub push completes the full path through Tailscale/OpenSSH | Verified on a real server | Real server run below: a merge to `main` built the binary on a GitHub-hosted runner, joined the tailnet through OIDC, and deployed with the CI key (`gh-40839230420-2`). |
 | No personal private key is uploaded; host trust is pinned | Verified | `test_github` (the secret is the dedicated key; no key material in results, state, or arguments); CI mode ignores `~/.ssh/config` (found and fixed by e2e 19); host keys come over the trusted connection. |
 | Deployment privileges scoped to the registered application and helper | Verified | Real sudo/sshd: `test_host_integration` (account cannot write its own access, cannot use admin), e2e 15 and 24 (each login refused for the other application). |
 | Secret values absent from repository files, normal output, artifacts | Verified for the paths tested | Env, registry token, CI key, sudo password: never in argv, results, state, or errors (`test_provision`, `test_commands`, `test_github`, `test_client`). The generated workflow passes secrets only through `env:`. |
@@ -89,6 +89,33 @@ Each of these passed its unit tests first:
 - CI-style SSH silently used `~/.ssh/config`, so a revoked CI key still "worked" via the personal key, and the setup check could pass on the wrong key.
 - The test harness itself hid failures behind a pipe to `tail`.
 
+## Real server run (Hetzner, 2026-10-28/29)
+
+An Ubuntu x86-64 VM reached over Tailscale, behind Cloudflare's proxy with a firewall that admits only Cloudflare.
+Application `hello`: a native Go binary, `hello.lordpatil.com`.
+
+| What | Result |
+| --- | --- |
+| `server bootstrap`, `provision` with password sudo | Succeeded. |
+| Native deploy, repeated deploy, `rollback` | v1 → v2 → back to v1; the repeat was `unchanged`, the rollback reused the retained binary. |
+| Failed release (`/ready` returns 503) | Exit 5, `rolled_back`, previous release restored and serving; Caddy untouched. |
+| Public HTTPS | Let's Encrypt certificate issued through Cloudflare's proxy; `https.verified: true`, `public.ok: true`. |
+| `github setup` (real `gh`, private repository) | CI key registered, proven, stored; variables set. Found a bug first (below). |
+| GitHub Actions deploy | First attempt refused by Tailscale (below); after correcting the subject, the run deployed v4 by itself. |
+
+What it found:
+
+- `github setup` proved the CI key against the administrator's SSH alias, which CI's hermetic SSH cannot resolve. Fixed:
+  the proof uses the resolved host, as CI does (also in `rotate-key`).
+- GitHub repositories with immutable OIDC subjects present `repo:Owner@<id>/name@<id>:...`, so a trust credential written
+  for `repo:Owner/name:...` is refused with a bare 403. `github setup` now reads the real subject from GitHub and prints it.
+- `caddy validate` ran without `HOME`, so Caddy wrote its storage to `./caddy` in the working directory: a stray `/caddy`
+  on the real server, and a failure for non-root users (GitHub's runner). Validation now gets a throwaway home.
+- On GitHub's runner, `userdel` refused the deployment account while a finished SSH session's user manager lingered.
+  `deprovision` now ends the account's sessions and retries.
+- Readiness only checks for HTTP 200, so an application whose catch-all handler answers `/ready` passes. Expected, and
+  documented: the ADK template's `/ready` checks its database.
+
 ## Deviations from the plan
 
 - **The compose host port is not made configurable.** The plan asked for it, but Shiplord never uses the template's
@@ -106,14 +133,13 @@ Each of these passed its unit tests first:
 
 ## Not verified, and why
 
-- Installation on your production server (needs interactive sudo, which was not granted) and the plan's §12E procedure.
-- The Tailscale federation and a live GitHub-hosted run (§12D): both need your accounts and administrative authority.
-- ACME certificate issuance and the public HTTPS check against a real DNS name (the check is unit-tested against a real TLS
-  server; real issuance was not run).
+- The plan's controlled installation procedure (§12E) on your production server; the real server run above used a separate VM.
+- The Docker runtime on a real server (verified in containers only), and the real ADK application's CORS.
+- `env set`, `recover`, `deprovision --retire` and `rotate-key` on a real server (verified in containers).
 - Private registry authentication end to end (the login file is accepted by the real `docker --config`; a registry that
   demands credentials was not run).
 - The real ADK application's CORS, readiness under load, and memory needs: the 512 MiB default is an example, not a measurement.
-- GitHub-hosted runners and x86-64 hardware; only arm64 Linux VMs were used.
+- x86-64 for the real-host container suites: they ran on arm64 VMs; GitHub's x86-64 runners run them in this repository's CI.
 - CI installs Shiplord's own dependencies unpinned (`pip install -e .`); a new release of one could change CI results.
 - Native services can still connect to other loopback services (only binding is restricted), and Docker applications share
   the default bridge network; see the README's *Limits of the confinement*.

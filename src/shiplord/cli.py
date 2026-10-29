@@ -14,7 +14,7 @@ from typing import Callable, Optional
 import typer
 
 from . import __version__
-from . import commands, github
+from . import commands, github, tailscale
 from .client import AdminClient, ClientError, HelperClient, bootstrap_server
 from .commands import CommandError
 from .configure import ConfigurationError, create_manifest
@@ -337,6 +337,21 @@ def env_clear(json_output: bool = typer.Option(False, "--json")) -> None:
     _execute(lambda: commands.set_environment(manifest, _admin(manifest), "clear"), json_output)
 
 
+def _ask_tailscale(instructions: dict) -> tuple[str, str] | None:
+    """Show the filled-in Tailscale steps and read the two identifiers (not secrets) from the terminal."""
+    typer.echo("Tailscale is not set up for CI yet. Shiplord cannot create the trust credential for you, but here is "
+               "exactly what to enter:\n")
+    for number, step in enumerate(instructions["steps"], 1):
+        typer.echo(f"  {number}. {step}")
+    if instructions.get("warning"):
+        typer.echo(f"\n  warning: {instructions['warning']}")
+    typer.echo("\nPaste the values below, or press Enter to skip and add them later.")
+    client_id = typer.prompt("Tailscale client ID", default="", show_default=False).strip()
+    if not client_id:
+        return None
+    return client_id, typer.prompt("Tailscale audience", default="", show_default=False).strip()
+
+
 def _tailscale_settings(client_id: Optional[str], audience: Optional[str], tags: Optional[str]) -> dict[str, str]:
     values = {"SHIPLORD_TS_CLIENT_ID": client_id, "SHIPLORD_TS_AUDIENCE": audience, "SHIPLORD_TS_TAGS": tags}
     settings = {name: value for name, value in values.items() if value}
@@ -398,13 +413,30 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
     manifest = _manifest(json_output)
 
     def action() -> tuple[int, dict]:
-        settings = _tailscale_settings(tailscale_client_id, tailscale_audience, tailscale_tags)
+        given = _tailscale_settings(tailscale_client_id, tailscale_audience, tailscale_tags)
+        gh = github.GitHub()
+        interactive = sys.stdin.isatty() and not json_output
+        try:
+            settings, origin = tailscale.resolve(
+                given, ask=_ask_tailscale if interactive else None,
+                guide=lambda: github.tailscale_guidance(gh, repo, manifest))
+        except tailscale.TailscaleError as error:
+            raise CommandError(str(error)) from None
         target = load_server(manifest["server"])
-        result = github.github_setup(manifest, repo, project=Path.cwd(), admin=AdminClient(target), gh=github.GitHub(),
+        result = github.github_setup(manifest, repo, project=Path.cwd(), admin=AdminClient(target), gh=gh,
                                      admin_target=target, ci_host=ci_host, tooling_ref=tooling_ref, platforms=platforms,
                                      tailscale=settings, force_workflow=force_workflow)
+        result["tailscale"] = origin
         return 0, result
     _execute(action, json_output)
+
+
+@github_app.command("check-ci")
+def github_check_ci_command(timeout: int = typer.Option(1200, "--timeout", help="Seconds to wait for the run."),
+                            json_output: bool = typer.Option(False, "--json")) -> None:
+    """Run the release workflow in check-only mode: join Tailscale, log in with the CI key, deploy nothing."""
+    manifest = _manifest(json_output)
+    _execute(lambda: github.check_ci(manifest, gh=github.GitHub(), timeout=timeout), json_output)
 
 
 @github_app.command("status")

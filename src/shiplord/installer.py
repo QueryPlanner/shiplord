@@ -21,8 +21,8 @@ from .release_state import HostLock
 from .routing import CaddyCommands, RouteManager, RoutingError
 from .system import CommandError, System
 
-CLIENT_MODULES = frozenset({"cli.py", "client.py", "commands.py", "configure.py", "github.py", "servers.py", "template.py",
-                            "transport.py", "workflow.py"})
+CLIENT_MODULES = frozenset({"cli.py", "client.py", "commands.py", "configure.py", "github.py", "servers.py",
+                            "tailscale.py", "template.py", "transport.py", "workflow.py"})
 LAUNCHERS = {
     "host_launcher.py": "shiplord.privileged_host",
     "admin_launcher.py": "shiplord.admin",
