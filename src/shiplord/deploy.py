@@ -18,6 +18,7 @@ from .registry import validate_registration
 from .release_state import ReleaseState, StateError, validate_release
 from .routing import RouteManager, RoutingError
 from .runtime import Runtime, RuntimeFailure, release_id
+from .storage import container_path
 
 MAX_FUTURE_SECONDS = 24 * 3600  # clock skew allowance; a far-future sequence would otherwise freeze the application
 SUCCESS = {"succeeded", "unchanged", "already_applied", "recovered", "nothing_to_recover"}
@@ -76,6 +77,9 @@ class Deployer:
             raise StateError("the artifact kind does not match the registered runtime")
         if candidate["configuration"]["http"]["api_domain"] != registration["api_domain"]:
             raise StateError("the hostname differs from the registration; changing it needs an administrator")
+        if "owner_uid" in candidate["configuration"].get("storage", {}):
+            # The initializer that would establish ownership needs a pinned, reviewed image that does not exist yet.
+            raise StateError("storage ownership (owner_uid/owner_gid) is not supported by this helper yet")
         if candidate["artifact"]["kind"] == "docker":
             if candidate["artifact"]["image"].split("@", 1)[0] != registration["image_repository"]:
                 raise StateError("the image repository is not the one registered for this application")
@@ -147,7 +151,13 @@ class Deployer:
         if current == candidate and self.runtime.is_running(self.registration, current) \
                 and self.probes.ready_once(self.registration, current):
             return {"action": "unchanged", **base}
-        return {"action": "deploy", "restarts_application": current is not None,
+        storage = {}
+        if candidate["artifact"]["kind"] == "docker":
+            old, new = (container_path(current["configuration"]) if current else None), container_path(candidate["configuration"])
+            storage = {"storage": {"current_path": old, "candidate_path": new, "same_volume": True,
+                                   "note": "the application's single volume is mounted at the candidate path; no files are moved "
+                                           "and no data is migrated" if old not in (None, new) else "no path change"}}
+        return {"action": "deploy", "restarts_application": current is not None, **storage,
                 "route_change": {"absent": "create", "different": "replace", "identical": "none"}[route], **base}
 
     def rollback(self, request_id: str) -> Outcome:

@@ -13,16 +13,20 @@ from shiplord.system import CommandError, CommandResult
 ID_A, ID_B = "a" * 64, "b" * 64
 
 
-def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=512):
-    return {"commit": commit * 40, "sequence": sequence,
+def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=512, storage=None):
+    value = {"commit": commit * 40, "sequence": sequence,
             "artifact": {"kind": "docker", "image": "ghcr.io/example/orders@sha256:" + image * 64},
             "configuration": {"schema_version": 1, "name": "orders", "server": "production", "template": "google-adk",
                               "runtime": "docker", "http": {"api_domain": "orders.example.com",
                               "frontend_origins": list(origins), "container_port": port, "readiness_path": "/ready"},
                               "resources": {"memory_mb": memory},
                               "deploy": {"readiness_timeout_seconds": 90, "retain_successful_releases": 2}}}
+    if storage is not None:
+        value["configuration"]["storage"] = storage
+    return value
 
 
+LEGACY_VOLUME = CommandResult(0, "local|null|null\n")
 REGISTRATION = {"application_id": "orders", "host_port": 20007, "api_domain": "orders.example.com"}
 
 
@@ -36,13 +40,13 @@ class FakeDocker:
         argv = list(argv)
         self.calls.append(argv)
         assert argv[0] == "/usr/bin/docker"
-        key = " ".join(argv[1:3]) if argv[1] in ("image",) else argv[1]
+        key = " ".join(argv[1:3]) if argv[1] in ("image", "volume") else argv[1]
         if key in self.raise_for:
             raise self.raise_for[key]
         return self.results.get(key, CommandResult(0, ""))
 
     def sub(self, name):
-        return [c for c in self.calls if (" ".join(c[1:3]) if c[1] == "image" else c[1]) == name]
+        return [c for c in self.calls if (" ".join(c[1:3]) if c[1] in ("image", "volume") else c[1]) == name]
 
 
 class RuntimeTestCase(unittest.TestCase):
@@ -52,6 +56,7 @@ class RuntimeTestCase(unittest.TestCase):
         self.layout = Layout(Path(self.temp.name).resolve())
         (self.layout.environments / "orders").mkdir(parents=True)
         self.docker = FakeDocker()
+        self.docker.results["volume inspect"] = LEGACY_VOLUME  # an existing volume from before labels existed
         self.runtime = DockerRuntime(self.docker, self.layout, platform_name="linux/amd64")
 
 
@@ -184,7 +189,7 @@ class StartTests(RuntimeTestCase):
                                    ("run", CommandResult(125, "bad flag"), "start")):
             with self.subTest(key):
                 self.docker.calls.clear()
-                self.docker.results = {"ps": CommandResult(0, ID_A + "\n"), key: result}
+                self.docker.results = {"volume inspect": LEGACY_VOLUME, "ps": CommandResult(0, ID_A + "\n"), key: result}
                 with self.assertRaises(RuntimeFailure) as caught:
                     self.runtime.start(REGISTRATION, release())
                 self.assertEqual(caught.exception.phase, phase)
@@ -206,15 +211,48 @@ class StartTests(RuntimeTestCase):
 
 
 class InspectTests(RuntimeTestCase):
+    def inspect_output(self, state="true false", image="b", mounts=("volume:shiplord-orders-artifacts:/app/src/.adk",)):
+        return CommandResult(0, f"{state} ghcr.io/example/orders@sha256:{image * 64} {' '.join(mounts)}\n")
+
     def test_is_running_reads_the_release_container_state(self):
-        self.docker.results["inspect"] = CommandResult(0, "true false\n")
+        self.docker.results["inspect"] = self.inspect_output()
         self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
         self.assertEqual(self.docker.calls[-1][-1], DockerRuntime.container_name(REGISTRATION, release()))
-        self.assertIn("{{.State.Running}} {{.State.Restarting}}", self.docker.calls[-1])
-        for result in (CommandResult(0, "false false\n"), CommandResult(0, "true true\n"),  # exited; crash-looping
-                       CommandResult(1, "No such object")):
+        for result in (self.inspect_output("false false"), self.inspect_output("true true"),  # exited; crash-looping
+                       CommandResult(1, "No such object"), CommandResult(0, "true\n")):
             self.docker.results["inspect"] = result
             self.assertFalse(self.runtime.is_running(REGISTRATION, release()), result)
+
+    def test_a_container_with_the_wrong_image_or_mount_is_not_the_release(self):
+        # Same name, same readiness answer: only the inspected image and mount prove which configuration runs.
+        wrong = {"another image": self.inspect_output(image="c"),
+                 "old mount path": self.inspect_output(mounts=("volume:shiplord-orders-artifacts:/data",)),
+                 "another volume": self.inspect_output(mounts=("volume:shiplord-other-artifacts:/app/src/.adk",)),
+                 "a bind mount": self.inspect_output(mounts=("bind::/app/src/.adk",)),
+                 "an extra mount": self.inspect_output(mounts=("volume:shiplord-orders-artifacts:/app/src/.adk", "volume:x:/y")),
+                 "no mount": self.inspect_output(mounts=())}
+        for label, result in wrong.items():
+            with self.subTest(label):
+                self.docker.results["inspect"] = result
+                self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_a_registry_alias_does_not_change_the_identity_but_a_digest_does(self):
+        mirrored = CommandResult(0, "true false localhost:5000/example/orders@sha256:" + "b" * 64
+                                 + " volume:shiplord-orders-artifacts:/app/src/.adk\n")
+        self.docker.results["inspect"] = mirrored
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
+        self.docker.results["inspect"] = CommandResult(0, mirrored.output.replace("b" * 64, "c" * 64))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+        self.docker.results["inspect"] = CommandResult(0, "true false orders:latest volume:shiplord-orders-artifacts:/app/src/.adk\n")
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_a_configured_path_is_the_one_verified_and_a_legacy_container_matches_the_default(self):
+        configured = release(storage={"container_path": "/data"})
+        self.docker.results["inspect"] = self.inspect_output(mounts=("volume:shiplord-orders-artifacts:/data",))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, configured))
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+        self.docker.results["inspect"] = self.inspect_output()
+        self.assertFalse(self.runtime.is_running(REGISTRATION, configured))
 
     def test_logs_are_bounded_and_empty_without_a_container(self):
         self.assertEqual(self.runtime.logs(REGISTRATION, 50), "")
@@ -229,6 +267,60 @@ class InspectTests(RuntimeTestCase):
         self.assertEqual(self.runtime.discard(REGISTRATION, release()), [])
         self.docker.results["image rm"] = CommandResult(1, "conflict: image is being used")
         self.assertEqual(len(self.runtime.discard(REGISTRATION, release())), 1)
+
+
+class StorageMountTests(RuntimeTestCase):
+    def run_argv(self, **kwargs):
+        self.docker.results["ps"] = CommandResult(0, "")
+        self.runtime.start(REGISTRATION, release(**kwargs))
+        return self.docker.sub("run")[0]
+
+    def test_the_configured_path_is_mounted_from_the_same_named_volume(self):
+        argv = self.run_argv(storage={"container_path": "/var/lib/handwriting"})
+        self.assertEqual(argv[argv.index("--volume") + 1], "shiplord-orders-artifacts:/var/lib/handwriting")
+        self.assertEqual(argv.count("--volume"), 1)
+
+    def test_a_missing_volume_is_created_labelled_and_local_before_anything_is_removed(self):
+        self.docker.results["volume inspect"] = CommandResult(1, "Error: No such volume: shiplord-orders-artifacts")
+        self.run_argv()
+        names = [" ".join(c[1:3]) if c[1] == "volume" else c[1] for c in self.docker.calls]
+        self.assertLess(names.index("volume create"), names.index("run"))
+        self.assertEqual(self.docker.sub("volume create")[0][2:], ["create", "--driver", "local", "--label",
+                         "shiplord.app=orders", "shiplord-orders-artifacts"])
+
+    def test_prepare_never_creates_a_volume(self):
+        self.docker.results["volume inspect"] = CommandResult(1, "Error: No such volume: x")
+        self.docker.results["image inspect"] = CommandResult(0, "linux/amd64|\n")
+        self.runtime.prepare(REGISTRATION, release())
+        self.assertEqual(self.docker.sub("volume create"), [])
+
+    def test_a_foreign_or_unexplained_volume_is_refused_before_any_container_is_touched(self):
+        bad = {"another driver": "nfs|null|null", "driver options": 'local|{"device":"/etc"}|null',
+               "another application's label": 'local|null|{"shiplord.app":"billing"}', "garbage": "nonsense"}
+        for label, output in bad.items():
+            with self.subTest(label):
+                self.docker.calls.clear()
+                self.docker.results["volume inspect"] = CommandResult(0, output)
+                with self.assertRaises(RuntimeFailure) as caught:
+                    self.run_argv()
+                self.assertEqual(caught.exception.phase, "storage")
+                self.assertEqual((self.docker.sub("rm"), self.docker.sub("run")), ([], []))
+
+    def test_an_inspection_failure_other_than_not_found_is_not_treated_as_absence(self):
+        self.docker.results["volume inspect"] = CommandResult(1, "Cannot connect to the Docker daemon")
+        with self.assertRaises(RuntimeFailure):
+            self.run_argv()
+        self.assertEqual(self.docker.sub("volume create"), [])
+
+    def test_a_labelled_volume_of_this_application_is_accepted(self):
+        self.docker.results["volume inspect"] = CommandResult(0, 'local|{}|{"shiplord.app":"orders"}')
+        self.run_argv()
+
+    def test_removing_containers_never_removes_volumes(self):
+        self.run_argv()
+        self.assertNotIn("-v", self.docker.sub("volume inspect")[0])
+        self.assertTrue(all("-v" not in c and "--volumes" not in c for c in self.docker.sub("rm")))
+        self.assertEqual(self.docker.sub("volume rm"), [])
 
 
 if __name__ == "__main__":

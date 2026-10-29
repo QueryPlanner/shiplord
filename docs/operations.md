@@ -49,6 +49,12 @@ application's state including any unfinished transaction.
 | Restoration itself fails | Exit 6; journal stays. | `shiplord recover`, then investigate. |
 | Client disconnects | The job continues. | `shiplord status`. |
 
+Storage: the application volume is never removed by deploy, rollback, recover, retirement or retention. If a deploy is
+refused with phase `storage`, the volume has another driver, driver options, or another application's label; inspect it
+with `docker volume inspect` as an administrator and resolve it deliberately. A running container is recognised only
+when its image digest and its volume mount (name and path) match the release, so a path-only change is replaced and
+restored correctly.
+
 A real reboot is not part of the automated tests. Docker containers use `--restart unless-stopped` and native
 units are enabled, but behavior after a power loss has not been verified.
 

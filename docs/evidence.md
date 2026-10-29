@@ -131,6 +131,18 @@ What it found:
 - **`doctor --server`** is a cheap protocol probe by default; `--deep` adds the sudo-backed health report.
 - **Registry pull logins** are per application, read-only, and stored root-only; only `ghcr.io` is accepted.
 
+## Configurable Docker storage (PR 1)
+
+- Unit: `tests/test_storage.py` (path/ownership validation, legacy records, plan, negotiation), `tests/test_runtime.py`
+  (mount path, volume provenance, container identity).
+- Real Docker (`tests/linux/run.sh docker`): `test_storage_path_changes_keep_one_volume_and_its_files` writes a counter
+  and SQLite rows at the legacy path, redeploys the same image/commit/sequence with `/data`, rolls back a failing
+  candidate that asked for another path, and returns to the legacy path; one volume throughout.
+- Not done: ownership initialization (`owner_uid`/`owner_gid` are rejected by the helper), the non-root UID 10001
+  fixture, interruption tests around volume creation, and proof that the path-only restoration regression fails on the
+  baseline in real Docker (the unit test shows it at the `is_running` boundary). Unlabelled legacy volumes are
+  accepted by name rather than by evidence of a retained container.
+
 ## Not verified, and why
 
 - The plan's controlled installation procedure (§12E) on your production server; the real server run above used a separate VM.

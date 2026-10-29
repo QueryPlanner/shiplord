@@ -43,7 +43,8 @@ import http.server, json, os, sys
 if os.environ.get("MODE") == "crash":
     print("fixture crashing on purpose", flush=True)
     sys.exit(1)
-ARTIFACTS = "/app/src/.adk"
+DATA = os.environ.get("DATA_DIR", "/app/src/.adk")  # the legacy path unless a test points the app elsewhere
+ARTIFACTS = DATA
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -57,6 +58,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/env":
             keys = ("ALLOW_ORIGINS", "SERVE_WEB_INTERFACE", "RELOAD_AGENTS", "AGENT_NAME", "HOST", "PORT", "AGENT_DIR", "CUSTOM_TOKEN")
             body = json.dumps({k: os.environ.get(k) for k in keys}).encode()
+        elif self.path == "/sqlite":
+            import sqlite3
+            database = sqlite3.connect(os.path.join(DATA, "app.db"))
+            database.execute("CREATE TABLE IF NOT EXISTS rows (id INTEGER PRIMARY KEY, version TEXT)")
+            database.execute("INSERT INTO rows (version) VALUES (?)", (os.environ["VERSION"],))
+            database.commit()
+            body = json.dumps([r[0] for r in database.execute("SELECT version FROM rows ORDER BY id")]).encode()
+            database.close()
         elif self.path == "/counter":
             path = os.path.join(ARTIFACTS, "counter")
             count = int(open(path).read()) + 1 if os.path.exists(path) else 1
@@ -72,7 +81,7 @@ print("fixture started version=" + os.environ["VERSION"], flush=True)
 http.server.ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT"])), Handler).serve_forever()
 '''
 DOCKERFILE = '''FROM python:3.12-slim
-RUN useradd -u 1000 -m app && mkdir -p /app/src/.adk && chown -R app:app /app
+RUN useradd -u 1000 -m app && mkdir -p /app/src/.adk /data && chown -R app:app /app
 USER app
 ARG VERSION
 ARG MODE=healthy
@@ -329,6 +338,48 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertEqual((status["running"], status["current"], status["unfinished_transaction"]),
                          (True, identity(state["current"]), None))
         self.assertEqual(release_id(state["current"]), self.inspect()["Config"]["Labels"]["shiplord.release"])
+
+    def storage_configuration(self, path):
+        value = self.configuration()
+        if path is not None:
+            value["storage"] = {"container_path": path}
+        return value
+
+    def set_data_dir(self, path):
+        env_file = self.layout.environments / self.app / "app.env"
+        env_file.write_text(f"DATA_DIR={path}\n")
+        env_file.chmod(0o600)
+
+    def test_storage_path_changes_keep_one_volume_and_its_files(self):
+        """The same volume is mounted at a new path: SQLite rows and files survive, rollback restores the old path."""
+        volume = f"shiplord-{self.app}-artifacts"
+        self.set_data_dir("/app/src/.adk")
+        self.assertOutcome(self.deploy("req-s1", "v1", 5000), "succeeded")
+        self.assertEqual(json.loads(self.get("/sqlite")), ["v1"])
+        counter = int(self.get("/counter"))
+
+        self.set_data_dir("/data")
+        moved = self.deploy("req-s2", "v1", 5000, configuration=self.storage_configuration("/data"))  # same image, commit, sequence
+        self.assertOutcome(moved, "succeeded")
+        mounts = [(m["Name"], m["Destination"]) for m in self.inspect()["Mounts"]]
+        self.assertEqual(mounts, [(volume, "/data")])
+        self.assertEqual(self.get("/counter"), str(counter + 1))  # relative file names are unchanged; nothing moved
+        self.assertEqual(json.loads(self.get("/sqlite")), ["v1", "v1"])
+        self.assertEqual(docker("volume", "ls", "-q", "--filter", f"name=shiplord-{self.app}").stdout.split(), [volume])
+
+        # a failing candidate with another path rolls back to a container that really has the previous path
+        failed = self.deploy("req-s3", "v3", 5001, configuration=self.storage_configuration("/var/lib/other"))
+        self.assertOutcome(failed, "rolled_back")
+        self.assertEqual([(m["Name"], m["Destination"]) for m in self.inspect()["Mounts"]], [(volume, "/data")])
+        self.assertEqual(self.get("/counter"), str(counter + 2))
+        self.assertTrue(self.runtime.is_running(self.registration, self.state.read_state()["current"]))
+
+        # back to the legacy path: still the same data, and the retained release records are not rewritten
+        self.set_data_dir("/app/src/.adk")
+        self.assertOutcome(self.deploy("req-s4", "v1", 5000, configuration=self.configuration()), "succeeded")
+        self.assertEqual([(m["Name"], m["Destination"]) for m in self.inspect()["Mounts"]], [(volume, "/app/src/.adk")])
+        self.assertEqual(json.loads(self.get("/sqlite")), ["v1", "v1", "v1"])
+        self.assertNotIn("storage", self.state.read_state()["current"]["configuration"])
 
     def runtime_rollback(self, request_id):
         with self.lock.acquire():
