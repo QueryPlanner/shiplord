@@ -57,6 +57,7 @@ class ManifestTests(unittest.TestCase):
             ("container_port = 8080", "container_port = 65536"),
             ("memory_mb = 512", "memory_mb = 0"),
             ("retain_successful_releases = 2", "retain_successful_releases = 1"),
+            ("retain_successful_releases = 2", "retain_successful_releases = 3"),
             ('api_domain = "orders-api.example.com"', 'api_domain = "*.example.com"'),
             ('api_domain = "orders-api.example.com"', 'api_domain = "127.0.0.1"'),
             ('api_domain = "orders-api.example.com"', 'api_domain = "Example.com"'),
@@ -114,28 +115,104 @@ class CLITests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertFalse(json.loads(result.stdout)["ok"])
 
-    def test_unimplemented_deploy_fails_without_server_access(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result = self.invoke(directory, "deploy", "--image", "ghcr.io/example/orders@sha256:abc", "--json")
-            self.assertEqual(list(Path(directory).iterdir()), [])
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("not implemented", json.loads(result.stdout)["error"])
-
-    def test_other_remote_commands_fail_without_writing_files(self):
-        commands = [
-            ["server", "bootstrap", "production"],
-            ["provision"], ["status", "--json"], ["logs", "--tail", "10"],
-            ["rollback", "--json"], ["recover", "--json"],
-            ["github", "setup", "--repo", "QueryPlanner/orders"],
-            ["github", "status", "--json"], ["github", "rotate-key"],
-        ]
+    def test_commands_that_need_a_manifest_fail_cleanly_without_one_and_write_nothing(self):
+        commands = [["provision", "--json"], ["status", "--json"], ["logs", "--tail", "10"], ["rollback", "--json"],
+                    ["recover", "--json"], ["plan", "--json"], ["env", "keys", "--json"], ["doctor", "--json"],
+                    ["deploy", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--json"]]
         with tempfile.TemporaryDirectory() as directory:
             for command in commands:
                 with self.subTest(command=command):
                     result = self.invoke(directory, *command)
-                    self.assertEqual(result.returncode, 1, result.stderr)
-                    self.assertIn("not implemented", result.stdout)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    if "--json" in command:
+                        self.assertIn("ship.toml", json.loads(result.stdout)["error"])
             self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_deprovision_requires_explicit_confirmation_before_any_connection(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            result = self.invoke(directory, "deprovision", "--retire", "--json", env=env)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("--yes", json.loads(result.stdout)["error"])
+
+    def test_deploy_validates_its_input_before_reading_any_server_alias(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)  # no server aliases exist here
+            for args, expected in ((["--image", "ghcr.io/example/orders:latest", "--commit", "a" * 40], "immutable"),
+                                   (["--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--commit", "main"], "40-character"),
+                                   ([], "--image")):
+                with self.subTest(args=args):
+                    result = self.invoke(directory, "deploy", *args, "--json", env=env)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(expected, json.loads(result.stdout)["error"])
+
+    def test_remote_commands_report_an_unknown_server_alias_as_a_prerequisite_failure(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            for command in (["status", "--json"], ["provision", "--json"], ["rollback", "--json"]):
+                with self.subTest(command=command):
+                    self.assertEqual(self.invoke(directory, *command, env=env).returncode, 3)
+            self.assertEqual(self.invoke(directory, "server", "bootstrap", "production", env=env).returncode, 3)
+
+    def test_deploy_requires_exactly_one_artifact_and_checks_it_against_the_manifest_runtime(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            script = Path(directory) / "app.sh"
+            script.write_text("#!/bin/sh\n")
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            image = "ghcr.io/example/orders@sha256:" + "a" * 64
+            cases = ((["--image", image, "--binary", str(script)], "exactly one"), ([], "exactly one"),
+                     (["--binary", str(script), "--commit", "a" * 40], "Docker image"))
+            for args, expected in cases:
+                with self.subTest(args=args):
+                    result = self.invoke(directory, "deploy", *args, "--json", env=env)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(expected, json.loads(result.stdout)["error"])
+            native = Path(directory) / "native"
+            native.mkdir()
+            (native / "ship.toml").write_text(MANIFEST.replace('runtime = "docker"', 'runtime = "native"'))
+            result = self.invoke(str(native), "deploy", "--binary", str(script), "--commit", "a" * 40, "--json", env=env)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("not a Linux ELF", json.loads(result.stdout)["error"])
+            result = self.invoke(str(native), "deploy", "--image", image, "--commit", "a" * 40, "--json", env=env)
+            self.assertIn("native binary", json.loads(result.stdout)["error"])
+
+    def test_registry_login_takes_the_token_only_from_a_file_or_stdin(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            result = self.invoke(directory, "registry", "login", "--username", "bot", "--token", "x", "--json", env=env)
+            self.assertEqual(result.returncode, 2)  # there is no --token option at all
+            for args in ([], ["--token-stdin", "--token-file", "f"]):
+                result = self.invoke(directory, "registry", "login", "--username", "bot", *args, "--json", env=env)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("exactly one", json.loads(result.stdout)["error"])
+            key = Path(directory) / "token"
+            key.write_text("ghp_exampleTOKEN1234567890\n")
+            result = self.invoke(directory, "registry", "login", "--username", "bad name", "--token-file", str(key), "--json", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertNotIn("ghp_example", result.stdout + result.stderr)
+            result = self.invoke(directory, "registry", "login", "--username", "bot", "--token-file", str(key), "--json", env=env)
+            self.assertEqual(result.returncode, 3)  # valid input; no server alias exists in this sandbox
+
+    def test_github_commands_need_a_manifest_and_a_server_alias(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
+            env = dict(os.environ, XDG_CONFIG_HOME=config)
+            for command in (["github", "setup", "--repo", "QueryPlanner/orders"], ["github", "status"], ["github", "rotate-key"]):
+                with self.subTest(command=command):
+                    self.assertEqual(self.invoke(directory, *command, "--json", env=env).returncode, 2)  # no ship.toml
+            (Path(directory) / "ship.toml").write_text(MANIFEST)
+            for command in (["github", "setup", "--repo", "QueryPlanner/orders"], ["github", "rotate-key"]):
+                with self.subTest(command=command):
+                    self.assertEqual(self.invoke(directory, *command, "--json", env=env).returncode, 3)  # alias unknown
+            result = self.invoke(directory, "github", "setup", "--repo", "QueryPlanner/orders", "--tailscale-tags", "ci",
+                                 "--json", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("tag:ci", json.loads(result.stdout)["error"])
+            self.assertEqual(list(Path(directory).iterdir()), [Path(directory) / "ship.toml"])
 
     def test_doctor_rejects_conflicting_modes(self):
         with tempfile.TemporaryDirectory() as directory:

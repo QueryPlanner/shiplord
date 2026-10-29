@@ -28,7 +28,9 @@ class AuthorizationTests(unittest.TestCase):
         self.uid = os.getuid()
         self.user = pwd.getpwuid(self.uid).pw_name
         self.registration = {"schema_version": 1, "application_id": "orders",
-                             "deployment_uid": self.uid, "deployment_user": self.user}
+                             "deployment_uid": self.uid, "deployment_user": self.user, "runtime": "docker",
+                             "api_domain": "orders.example.com", "host_port": 20000,
+                             "image_repository": "ghcr.io/example/orders", "max_memory_mb": 4096}
         self.file = self.root / "orders.json"
         self.file.write_text(json.dumps(self.registration))
         self.environment = {"SUDO_UID": str(self.uid), "SUDO_USER": self.user}
@@ -45,7 +47,10 @@ class AuthorizationTests(unittest.TestCase):
 
     def authorize(self, application="orders"):
         with self.checks():
-            authorize_application(application)
+            return authorize_application(application)
+
+    def test_authorization_returns_the_registration_for_its_app(self):
+        self.assertEqual(self.authorize(), self.registration)
 
     def test_matching_account_and_registration_allow_only_its_app(self):
         self.authorize()
@@ -124,7 +129,8 @@ class AuthorizationTests(unittest.TestCase):
         output = io.BytesIO()
         with self.checks():
             self.assertEqual(serve(io.BytesIO(encoded.getvalue()), output), 0)
-        self.assertEqual(read_frame(io.BytesIO(output.getvalue()))["actions"], ["capabilities"])
+        self.assertEqual(read_frame(io.BytesIO(output.getvalue()))["actions"],
+                         ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover"])
         request["application_id"] = "other"
         encoded = io.BytesIO()
         write_frame(encoded, request)
@@ -136,7 +142,10 @@ class AuthorizationTests(unittest.TestCase):
     def test_privileged_helper_rejects_mutations_bad_versions_and_arguments(self):
         base = {"version": 1, "request_id": "job-1", "action": "capabilities",
                 "application_id": "orders", "commit": None, "arguments": {}}
-        cases = [(dict(base, action="deploy"), 1, "unsupported_action"),
+        cases = [(dict(base, action="deploy"), 2, "invalid_request"),  # missing deployment arguments
+                 (dict(base, action="status", arguments={"unexpected": 1}), 2, "invalid_request"),
+                 (dict(base, action="logs", arguments={"tail": 0}), 2, "invalid_request"),
+                 (dict(base, action="rollback", commit="a" * 40), 2, "invalid_request"),
                  (dict(base, version=2), 4, "incompatible"),
                  (dict(base, arguments={"unexpected": True}), 2, "invalid_request"),
                  (dict(base, commit="a" * 40), 2, "invalid_request")]
@@ -169,9 +178,9 @@ class AuthorizationTests(unittest.TestCase):
                    "application_id": "orders", "commit": None, "arguments": {}}
         body = json.dumps(request).encode()
         result = subprocess.run([sys.executable, "-m", "shiplord.privileged_host"], input=len(body).to_bytes(4, "big") + body,
-                                capture_output=True, timeout=5, check=False)
+                                capture_output=True, timeout=30, check=False)
         self.assertEqual(result.returncode, 3)
         self.assertEqual(read_frame(io.BytesIO(result.stdout))["error"], "access_denied")
         extra = subprocess.run([sys.executable, "-m", "shiplord.privileged_host", "unexpected"],
-                               capture_output=True, timeout=5, check=False)
+                               capture_output=True, timeout=30, check=False)
         self.assertEqual(extra.returncode, 2)

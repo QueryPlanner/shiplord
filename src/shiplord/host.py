@@ -54,6 +54,11 @@ def serve(source: BinaryIO, destination: BinaryIO) -> int:
     return code
 
 
+def extend_deadline(seconds: float) -> None:
+    """Re-arm the overall deadline, for the one request type that legitimately streams a large upload."""
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+
+
 def run_timed(handler) -> int:
     """Run one stdio request with a server-side deadline."""
     signal.signal(signal.SIGALRM, _deadline_expired)

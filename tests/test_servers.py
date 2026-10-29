@@ -34,7 +34,7 @@ class ServerRegistrationTests(unittest.TestCase):
     def test_registration_uses_strict_fresh_ssh_and_private_storage(self):
         result = self.invoke("production", "--ssh", "appuser@ubuntu-4gb-hel1-1")
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("CI host-key setup are not implemented", result.output)
+        self.assertIn("Run `shiplord server bootstrap` next", result.output)
         options = (self.root / "arguments").read_text().splitlines()
         for option in ("BatchMode=yes", "StrictHostKeyChecking=yes", "VerifyHostKeyDNS=no",
                        "UpdateHostKeys=no", "ControlMaster=no", "ControlPath=none",
