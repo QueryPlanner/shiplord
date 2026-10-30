@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import platform
 import shutil
 import time
@@ -88,9 +89,10 @@ class DockerRuntime:
     """Docker via the CLI. The server's platform is derived from the host unless given."""
 
     def __init__(self, system: System, layout: Layout, *, platform_name: str | None = None,
-                 clock=time.monotonic, sleep=time.sleep):
+                 clock=time.monotonic, sleep=time.sleep, wall_clock=time.time):
         self.system, self.layout = system, layout
         self.clock, self.sleep = clock, sleep
+        self.wall_clock = wall_clock
         self.stop_report: list[dict] = []  # what stopping did: stages, elapsed time, policy, whether force was needed
         self.platform = platform_name or _MACHINE_PLATFORMS.get(platform.machine().lower(), "linux/amd64")
 
@@ -138,13 +140,18 @@ class DockerRuntime:
         revision = "" if revision == "<no value>" else revision
         if revision and revision != release["commit"]:
             raise RuntimeFailure("the image was built from a different commit than requested", "prepare")
-        self.check_volume(registration, create=False)  # read-only: a plan or a refused deploy creates nothing
-        return {"platform": image_platform, "revision_label": revision or None}
+        volume_provenance = self.check_volume(registration, create=False)  # read-only: a plan creates nothing
+        result = {"platform": image_platform, "revision_label": revision or None}
+        if volume_provenance is not None:
+            # The deployer persists this proof in the journal before replacing the retained container.
+            result["storage_provenance"] = volume_provenance
+        return result
 
-    def check_volume(self, registration: dict, *, create: bool) -> None:
-        """Accept only this application's plain local volume; optionally create it (never in a read-only plan)."""
+    def check_volume(self, registration: dict, *, create: bool, provenance: dict | None = None) -> dict | None:
+        """Accept this application's volume, with retained-container proof for legacy unlabelled volumes."""
         name = self.volume_name(registration)
-        inspect = self._docker(["volume", "inspect", "--format", "{{.Driver}}|{{json .Options}}|{{json .Labels}}", name],
+        inspect = self._docker(["volume", "inspect", "--format",
+                                "{{.Driver}}|{{json .Options}}|{{json .Labels}}|{{.CreatedAt}}|{{.Mountpoint}}", name],
                                "storage")
         if inspect.code != 0:
             if "no such volume" not in inspect.output.lower():
@@ -154,24 +161,61 @@ class DockerRuntime:
                                      f"shiplord.app={registration['application_id']}", name], "storage")
                 if made.code != 0:
                     raise RuntimeFailure("the application volume could not be created", "storage", made.output)
-            return
+            return None
         try:
-            driver, options, labels = inspect.output.strip().split("|", 2)
+            driver, options, labels, created_at, mountpoint = inspect.output.strip().split("|", 4)
             options, labels = json.loads(options) or {}, json.loads(labels) or {}
         except (ValueError, TypeError):
             raise RuntimeFailure("the application volume could not be understood", "storage") from None
-        if driver != "local" or options or not isinstance(labels, dict) or labels.get("shiplord.app", registration["application_id"]) != registration["application_id"]:
+        if (driver != "local" or options or not isinstance(labels, dict) or not created_at
+                or not mountpoint.startswith("/")):
+            raise RuntimeFailure("the application volume does not match what Shiplord manages; nothing was changed", "storage")
+        owner = labels.get("shiplord.app")
+        if owner == registration["application_id"]:
+            return None
+        if owner is not None or labels:
             raise RuntimeFailure("the application volume does not match what Shiplord manages; nothing was changed", "storage")
 
+        fingerprint = hashlib.sha256((created_at + "\0" + mountpoint).encode()).hexdigest()
+        if (isinstance(provenance, dict) and provenance.get("volume_name") == name
+                and provenance.get("fingerprint") == fingerprint):
+            return provenance
+        retained = self._legacy_volume_container(registration, name)
+        if retained is None:
+            raise RuntimeFailure("the unlabelled application volume has no retained Shiplord container evidence", "storage")
+        return {"volume_name": name, "fingerprint": fingerprint, "container_id": retained}
+
+    def _legacy_volume_container(self, registration: dict, volume_name: str) -> str | None:
+        """Return a retained Shiplord container ID only when its labels and exact volume mount agree."""
+        for identifier in self._container_ids(registration, "storage"):
+            inspected = self._docker(["inspect", "--format",
+                                      "{{.Name}}|{{index .Config.Labels \"shiplord.app\"}}|"
+                                      "{{index .Config.Labels \"shiplord.release\"}}|"
+                                      "{{range .Mounts}}{{.Type}}:{{.Name}}:{{.Destination}} {{end}}", identifier],
+                                     "storage")
+            if inspected.code != 0:
+                raise RuntimeFailure("a retained container could not be inspected for volume provenance", "storage",
+                                     inspected.output)
+            try:
+                retained_name, app_label, release_label, mounts = inspected.output.strip().split("|", 3)
+            except ValueError:
+                raise RuntimeFailure("a retained container could not be understood for volume provenance", "storage") from None
+            if (app_label == registration["application_id"]
+                    and len(release_label) == 12 and all(char in "0123456789abcdef" for char in release_label)
+                    and retained_name.lstrip("/") == f"shiplord-{registration['application_id']}-{release_label}"
+                    and any(mount.startswith(f"volume:{volume_name}:") for mount in mounts.split())):
+                return identifier
+        return None
+
     def _container_ids(self, registration: dict, phase: str = "stop") -> list[str]:
-        listing = self._docker(["ps", "-aq", "--no-trunc", "--filter", f"label=shiplord.app={registration['application_id']}"],
-                               phase)
+        listing = self._docker(["ps", "-aq", "--no-trunc", "--filter",
+                                f"label=shiplord.app={registration['application_id']}"], phase)
         if listing.code != 0:
             raise RuntimeFailure("existing containers could not be listed", phase, listing.output)
         identifiers = listing.output.split()
-        for identifier in identifiers:
-            if len(identifier) != 64 or not all(c in "0123456789abcdef" for c in identifier):
-                raise RuntimeFailure("unexpected container listing", phase)
+        if any(len(identifier) != 64 or any(char not in "0123456789abcdef" for char in identifier)
+               for identifier in identifiers):
+            raise RuntimeFailure("unexpected container listing", phase)
         return identifiers
 
     _INSPECT = ("{{.State.Status}} {{.HostConfig.RestartPolicy.Name}} {{.Config.StopSignal}}"
@@ -228,70 +272,164 @@ class DockerRuntime:
                 return True
         return False
 
-    def _remove_containers(self, registration: dict) -> None:
+    def _remove_containers(self, registration: dict, state=None) -> None:
         """Gracefully stop whatever runs for the application (under its own recorded policy), then remove it."""
         self.stop_report = []
-        outgoing = [self._outgoing(identifier) for identifier in self._container_ids(registration)]
+        journal = state.read_journal() if state is not None else None
+        pending = None if journal is None else journal.get("stop")
+        if pending is not None:
+            identifier = pending["container_id"]
+            if self._state(identifier) == "gone":
+                state.clear_stop(identifier)
+            else:
+                container = self._outgoing(identifier)
+                self._stop_gracefully(container, state, pending)
+                self._remove(identifier)
+                state.clear_stop(identifier)
+
+        outgoing = [self._outgoing(identifier) for identifier in self._container_ids(registration)
+                    if pending is None or identifier != pending["container_id"]]
         live = [c for c in outgoing if c["status"] in ("running", "paused", "restarting")]
         if len(live) > 1:  # nothing is signalled while it is unclear which process is the application
             raise RuntimeFailure("more than one container is running for this application", "stop",
                                  intervention_required=True, kind="ambiguous")
         for container in outgoing:
             if container["status"] in ("running", "paused", "restarting"):
-                self._stop_gracefully(container)
+                self._stop_gracefully(container, state)
             self._remove(container["id"])
+            if state is not None:
+                journal = state.read_journal()
+                record = None if journal is None else journal.get("stop")
+                if record is not None and record["container_id"] == container["id"]:
+                    state.clear_stop(container["id"])
 
-    def _stop_gracefully(self, container: dict) -> None:
+    def _stop_gracefully(self, container: dict, state=None, record: dict | None = None) -> None:
         identifier, started = container["id"], self.clock()
-        report = {"timeout_seconds": container["timeout"], "action": container["action"], "stages": ["stop_requested"],
-                  "forced": False}
-        self.stop_report.append(report)
-        signal = stop_signal(container["signal"])  # validated before anything is changed or sent
+        signal = stop_signal(container["signal"])  # validate before changing restart policy or signalling
         if container["status"] == "paused":
             raise RuntimeFailure("the container is paused and cannot handle a shutdown signal", "stop",
                                  intervention_required=True, kind="paused")
-        if container["restart_policy"] != "no":
-            update = self._docker(["update", "--restart=no", identifier], "stop")  # first: nothing may restart it
-            if update.code != 0:
-                raise RuntimeFailure("the container's restart policy could not be disabled", "stop", update.output)
-            sent = self._docker(["kill", "--signal", signal, identifier], "stop")
-            if sent.code != 0 and self._state(identifier) not in ("exited", "dead", "gone"):
-                raise RuntimeFailure("the shutdown signal could not be sent", "stop", sent.output)
+        if record is None and state is not None:
+            journal = state.read_journal()
+            record = None if journal is None else journal.get("stop")
+        if record is not None:
+            if (record["container_id"] != identifier or record["timeout_seconds"] != container["timeout"]
+                    or record["action"] != container["action"] or record["signal"] != signal):
+                raise RuntimeFailure("the saved shutdown intent does not match the container", "stop",
+                                     intervention_required=True, kind="shutdown_record_mismatch")
+        elif container["restart_policy"] == "no" and state is not None:
+            # A prior helper may have disabled restart before this version added durable stop intent.
+            raise RuntimeFailure("the container has a shutdown in progress without a saved intent; manual recovery is required",
+                                 "stop", intervention_required=True, kind="shutdown_in_progress")
+        elif container["restart_policy"] == "no":
+            # Preserve the standalone runtime behavior for callers without a transaction store. Deployer uses the
+            # durable path above, so production recovery always has a saved deadline and phase.
+            deadline = self.wall_clock() if container["action"] == "fail" else self.wall_clock() + container["timeout"]
+            record = {"container_id": identifier, "restart_policy": "no", "timeout_seconds": container["timeout"],
+                      "action": container["action"], "signal": signal, "deadline_epoch": math.ceil(deadline),
+                      "phase": "signalled"}
+        else:
+            record = {"container_id": identifier, "restart_policy": container["restart_policy"],
+                      "timeout_seconds": container["timeout"], "action": container["action"], "signal": signal,
+                      "deadline_epoch": math.ceil(self.wall_clock() + container["timeout"]), "phase": "intent"}
+            if state is not None:
+                state.write_stop(record)
+        report = {"timeout_seconds": container["timeout"], "action": container["action"], "stages": ["stop_requested"],
+                  "forced": False}
+        self.stop_report.append(report)
+        phase = record["phase"]
+        if phase == "intent":
+            if container["restart_policy"] != "no":
+                update = self._docker(["update", "--restart=no", identifier], "stop")
+                if update.code != 0:
+                    raise RuntimeFailure("the container's restart policy could not be disabled", "stop", update.output)
+            record = self._advance_stop(state, record, "restart_disabled")
+            phase = record["phase"]
+        if phase == "restart_disabled":
+            record = self._advance_stop(state, record, "signal_pending")
+            phase = record["phase"]
+        if phase == "signal_pending":
+            current = self._state(identifier)
+            if current not in ("exited", "dead", "gone", "created"):
+                sent = self._docker(["kill", "--signal", signal, identifier], "stop")
+                if sent.code != 0 and self._state(identifier) not in ("exited", "dead", "gone", "created"):
+                    raise RuntimeFailure("the shutdown signal could not be sent", "stop", sent.output,
+                                         intervention_required=True, kind="signal_unconfirmed")
+            record = self._advance_stop(state, record, "signalled")
+            phase = record["phase"]
             report["stages"].append("signalled")
-        elif container["action"] == "fail":  # a previous worker already signalled it: never signal again, never kill
-            if self._state(identifier) in ("exited", "dead", "gone"):
-                report["stages"].append("exited")
-                return
-            self._expired(container, report, started)
-        # The original deadline is not persisted, so a continuing attempt waits a full period without re-signalling.
         report["stages"].append("waiting")
-        if self._wait_exit(identifier, container["timeout"]):
+        remaining = max(0, min(record["timeout_seconds"], record["deadline_epoch"] - self.wall_clock()))
+        if self._wait_exit(identifier, remaining):
             report["stages"].append("exited")
             report["elapsed_seconds"] = round(self.clock() - started, 1)
             return
-        if container["action"] == "fail":
-            self._expired(container, report, started)
-        killed = self._docker(["kill", "--signal", "KILL", identifier], "stop")
-        if killed.code != 0 and self._state(identifier) not in ("exited", "dead", "gone"):
-            raise RuntimeFailure("the container could not be killed after its shutdown deadline", "stop", killed.output)
-        report["forced"] = True
-        report["stages"].append("forced")
+        if record["action"] == "fail":
+            self._expired(record, report, started)
+        if phase in ("signalled", "kill_pending"):
+            if phase != "kill_pending":
+                record = self._advance_stop(state, record, "kill_pending")
+            current = self._state(identifier)
+            if current not in ("exited", "dead", "gone", "created"):
+                killed = self._docker(["kill", "--signal", "KILL", identifier], "stop")
+                if killed.code != 0 and self._state(identifier) not in ("exited", "dead", "gone", "created"):
+                    raise RuntimeFailure("the container could not be killed after its shutdown deadline", "stop",
+                                         killed.output, intervention_required=True, kind="kill_unconfirmed")
+            record = self._advance_stop(state, record, "killed")
+            report["forced"] = True
+            report["stages"].append("forced")
+        elif phase == "killed":
+            # A worker may have stopped after KILL was sent but before exit was confirmed.
+            current = self._state(identifier)
+            if current not in ("exited", "dead", "gone", "created"):
+                killed = self._docker(["kill", "--signal", "KILL", identifier], "stop")
+                if killed.code != 0 and self._state(identifier) not in ("exited", "dead", "gone", "created"):
+                    raise RuntimeFailure("the container could not be killed after its shutdown deadline", "stop",
+                                         killed.output, intervention_required=True, kind="kill_unconfirmed")
+            report["forced"] = True
+        else:
+            raise RuntimeFailure("the saved shutdown phase is invalid", "stop", intervention_required=True,
+                                 kind="shutdown_record_mismatch")
         if not self._wait_exit(identifier, FORCE_EXIT_SECONDS):
             raise RuntimeFailure("the container did not exit after being killed", "stop", intervention_required=True,
                                  kind="kill_unconfirmed")
         report["elapsed_seconds"] = round(self.clock() - started, 1)
 
-    def _expired(self, container: dict, report: dict, started: float) -> None:
+    @staticmethod
+    def _advance_stop(state, record: dict, phase: str) -> dict:
+        updated = dict(record, phase=phase)
+        if state is not None:
+            state.write_stop(updated)
+        return updated
+
+    def _expired(self, record: dict, report: dict, started: float) -> None:
         report["stages"].append("deadline_expired")
         report["elapsed_seconds"] = round(self.clock() - started, 1)
-        raise RuntimeFailure(f"the application did not stop within {container['timeout']} seconds and its policy is not "
+        raise RuntimeFailure(f"the application did not stop within {record['timeout_seconds']} seconds and its policy is not "
                              "to force it; it was signalled and may still exit. Run `shiplord recover` once it has",
                              "stop", intervention_required=True, kind="shutdown_timeout")
+
+
 
     def stop(self, registration: dict) -> None:
         self._remove_containers(registration)
 
+    def stop_with_state(self, registration: dict, state) -> None:
+        """Resume or begin a journaled graceful stop for a locked deployment transaction."""
+        self._remove_containers(registration, state)
+
     def start(self, registration: dict, release: dict) -> None:
+        self._start(registration, release)
+
+    def start_with_provenance(self, registration: dict, release: dict, provenance: dict) -> None:
+        """Start a release using legacy-volume proof persisted before its retained container was removed."""
+        self._start(registration, release, provenance)
+
+    def start_with_state(self, registration: dict, release: dict, state, provenance: dict | None = None) -> None:
+        """Start a release while persisting shutdown progress in its transaction journal."""
+        self._start(registration, release, provenance, state)
+
+    def _start(self, registration: dict, release: dict, provenance: dict | None = None, state=None) -> None:
         """Replace whatever runs for this application with a container for ``release``."""
         config = release["configuration"]
         http = config["http"]
@@ -299,8 +437,8 @@ class DockerRuntime:
             custom = load_environment_file(self.layout.environments / registration["application_id"] / "app.env")
         except EnvironmentError_ as error:
             raise RuntimeFailure(f"the environment file is unusable: {error}", "start") from None
-        self.check_volume(registration, create=True)  # before the running release is touched
-        self._remove_containers(registration)
+        self.check_volume(registration, create=True, provenance=provenance)  # before the running release is touched
+        self._remove_containers(registration, state)
         timeout, action = policy(config)
         memory = f"{config['resources']['memory_mb']}m"
         argv = ["run", "--detach", "--name", self.container_name(registration, release),
@@ -332,18 +470,35 @@ class DockerRuntime:
         Running=true while Docker waits to restart it; that is not "running" either.
         """
         result = self._docker(["inspect", "--format",
-                               "{{.State.Running}} {{.State.Restarting}} {{.Config.Image}}"
+                               "{{.State.Running}} {{.State.Restarting}} {{.Config.Image}}|"
+                               "{{index .Config.Labels \"shiplord.shutdown_timeout\"}}|"
+                               "{{index .Config.Labels \"shiplord.shutdown_action\"}}|"
                                "{{range .Mounts}} {{.Type}}:{{.Name}}:{{.Destination}}{{end}}",
                                self.container_name(registration, release)], "inspect")
         if result.code != 0:
             return False
-        fields = result.output.split()
-        if len(fields) < 3:
+        try:
+            head, timeout_label, action_label, mount_list = result.output.strip().split("|", 3)
+        except ValueError:
             return False
-        running, restarting, image, *mounts = fields
+        fields = head.split()
+        if len(fields) != 3:
+            return False
+        running, restarting, image = fields
+        absent = ("<no value>", "")
+        if timeout_label in absent and action_label in absent:
+            actual_policy = (DEFAULT_TIMEOUT_SECONDS, DEFAULT_ACTION)
+        elif timeout_label.isdigit() and 1 <= int(timeout_label) <= 300 and action_label in ("force", "fail"):
+            actual_policy = (int(timeout_label), action_label)
+        else:
+            return False
         expected = f"volume:{self.volume_name(registration)}:{container_path(release['configuration'])}"
-        return (running, restarting) == ("true", "false") and _digest(image) == _digest(release["artifact"]["image"]) \
-            and mounts == [expected]
+        # Docker adds one anonymous mount for every VOLUME instruction in an image. Those are compatible when the
+        # Shiplord-managed volume is still present exactly once at the configured path.
+        return ((running, restarting) == ("true", "false")
+                and _digest(image) == _digest(release["artifact"]["image"])
+                and actual_policy == policy(release["configuration"])
+                and mount_list.split().count(expected) == 1)
 
     def logs(self, registration: dict, tail: int) -> str:
         tail = max(1, min(int(tail), MAX_LOG_LINES))

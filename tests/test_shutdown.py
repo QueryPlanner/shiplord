@@ -19,12 +19,12 @@ from shiplord.manifest import ManifestError, validate_manifest  # noqa: E402
 from shiplord.release_state import StateError, validate_release  # noqa: E402
 from shiplord.retire import make_retirer  # noqa: E402
 from shiplord.runtime import DockerRuntime, RuntimeFailure, stop_signal  # noqa: E402
-from shiplord.shutdown import check_budget, policy, ShutdownError  # noqa: E402
+from shiplord.shutdown import check_budget, check_recovery_budget, policy, ShutdownError, worst_case_seconds  # noqa: E402
 from shiplord.system import CommandResult  # noqa: E402
 from test_client import ClientTestCase  # noqa: E402
 from test_commands import COMMIT, IMAGE  # noqa: E402
 from test_deploy import DeployTestCase  # noqa: E402
-from test_runtime import LEGACY_VOLUME, REGISTRATION, release  # noqa: E402
+from test_runtime import LABELLED_VOLUME, REGISTRATION, release  # noqa: E402
 
 ID_A, ID_B = "a" * 64, "b" * 64
 
@@ -77,8 +77,22 @@ class BudgetTests(unittest.TestCase):
         check_budget(validate_manifest(configuration(shutdown_timeout_seconds=120, shutdown_timeout_action="fail")))
 
     def test_a_policy_that_cannot_finish_inside_the_job_limit_is_refused(self):
+        candidate = validate_manifest(configuration(shutdown_timeout_seconds=300, readiness_timeout_seconds=900))
+        check_budget(candidate)
+
+    def test_budget_uses_the_actual_outgoing_readiness_and_stop_policy(self):
+        outgoing = validate_manifest(configuration(readiness_timeout_seconds=900))
+        candidate = validate_manifest(configuration(shutdown_timeout_seconds=300, readiness_timeout_seconds=530))
+        self.assertEqual(worst_case_seconds(candidate, outgoing), 3680)
         with self.assertRaisesRegex(ShutdownError, "exceeds the 3600s job limit"):
-            check_budget(validate_manifest(configuration(shutdown_timeout_seconds=300, readiness_timeout_seconds=900)))
+            check_budget(candidate, outgoing)
+
+    def test_recovery_budget_includes_the_saved_candidate_and_target(self):
+        candidate = record()
+        candidate["configuration"] = configuration(shutdown_timeout_seconds=300, readiness_timeout_seconds=530)
+        target = record()
+        target["configuration"] = configuration(readiness_timeout_seconds=900)
+        check_recovery_budget(candidate, target)
 
 
 class SignalTests(unittest.TestCase):
@@ -101,7 +115,7 @@ class ScriptedDocker:
         self.containers: dict[str, dict] = {}
         self.calls: list[list[str]] = []
         self.fail: dict[str, CommandResult] = {}
-        self.volume = LEGACY_VOLUME
+        self.volume = LABELLED_VOLUME
 
     def add(self, identifier, *, status="running", restart="unless-stopped", signal="", timeout="10", action="force",
             drain=0.0, stubborn=False, labels=True):
@@ -310,7 +324,8 @@ class StopTests(unittest.TestCase):
                 self.docker.add(ID_A, stubborn=True, action="force")
                 with self.assertRaises(RuntimeFailure) as caught:
                     self.replace()
-                self.assertFalse(caught.exception.intervention_required)
+                # A failed signal command has uncertain delivery, so recovery must retain the journal and retry it.
+                self.assertEqual(caught.exception.intervention_required, failing == "kill")
                 self.assertNotIn("KILL", [c[3] for c in self.docker.sub("kill") if len(c) > 3])
                 self.assertEqual(self.docker.sub("run"), [])
 
@@ -408,8 +423,10 @@ class DeployerTests(DeployTestCase):
         self.assertEqual(plan["shutdown"]["candidate_policy"], {"timeout_seconds": 120, "action": "fail"})
 
     def test_a_budget_that_cannot_fit_is_rejected_before_anything_changes(self):
-        value = request()
-        value["configuration"] = configuration(shutdown_timeout_seconds=300, readiness_timeout_seconds=900)
+        self.assertEqual(self.deploy(configuration=configuration(readiness_timeout_seconds=900)).status, "succeeded")
+        self.runtime.calls.clear()
+        value = request(request_id="req-2", commit="b", image="b", sequence=1001,
+                        configuration=configuration(shutdown_timeout_seconds=300, readiness_timeout_seconds=530))
         outcome = self.run_locked(self.deployer.deploy, value)
         self.assertEqual((outcome.status, outcome.exit_code), ("rejected", 2))
         self.assertEqual(self.runtime.calls, [])
@@ -452,9 +469,9 @@ class NegotiationTests(ClientTestCase):
 
     def test_the_client_waits_for_both_possible_stops(self):
         legacy = validate_manifest(configuration())
-        self.assertEqual(commands.job_timeout(legacy), 90 + 900)  # unchanged for existing manifests
+        self.assertEqual(commands.job_timeout(legacy), 3600 + 30)
         explicit = self.manifest()
-        self.assertEqual(commands.job_timeout(explicit), 90 + 900 + 2 * (120 + 10))
+        self.assertEqual(commands.job_timeout(explicit), 3600 + 30)
 
     def test_a_plan_through_the_real_helper_shows_both_policies(self):
         code, plan = commands.plan_application(self.manifest(), self.client, image=IMAGE, commit=COMMIT, sequence=1000)

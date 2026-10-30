@@ -134,14 +134,20 @@ What it found:
 ## Configurable Docker storage (PR 1)
 
 - Unit: `tests/test_storage.py` (path/ownership validation, legacy records, plan, negotiation), `tests/test_runtime.py`
-  (mount path, volume provenance, container identity).
+  (mount path, retained-container volume provenance, and image-declared mounts).
 - Real Docker (`tests/linux/run.sh docker`): `test_storage_path_changes_keep_one_volume_and_its_files` writes a counter
   and SQLite rows at the legacy path, redeploys the same image/commit/sequence with `/data`, rolls back a failing
   candidate that asked for another path, and returns to the legacy path; one volume throughout.
+- Real Docker: `test_z_image_declared_volume_does_not_break_readiness_or_release_identity` deploys an image declaring
+  `VOLUME /scratch`; readiness and release identity still pass with Docker's additional anonymous mount.
 - Not done: ownership initialization (`owner_uid`/`owner_gid` are rejected by the helper), the non-root UID 10001
   fixture, interruption tests around volume creation, and proof that the path-only restoration regression fails on the
-  baseline in real Docker (the unit test shows it at the `is_running` boundary). Unlabelled legacy volumes are
-  accepted by name rather than by evidence of a retained container.
+  baseline in real Docker (the unit test shows it at the `is_running` boundary). A legacy unlabelled volume is accepted
+  only when a retained Shiplord container proves the exact volume; that proof is tied to the inspected volume identity
+  in the transaction journal.
+- **Handwriting Studio adoption remains blocked** until a pinned initializer image is reviewed and a fresh volume is
+  proven writable by UID 10001 in the real-Docker suite. The helper continues to reject `owner_uid`/`owner_gid` until
+  both prerequisites pass.
 
 ## Graceful Docker replacement (PR 2)
 
@@ -151,9 +157,11 @@ What it found:
 - Real Docker (`tests/linux/run.sh docker`): signal-aware PID 1 flushes a SQLite row and file before the candidate starts;
   an ignoring process is force-killed after its deadline; with `fail` the original keeps running, recovery refuses while it
   drains and succeeds after it exits.
-- Not done: killing a real worker at each point in the stop sequence, the marked real 120-second drain test (short delays
-  used), persisted stop deadline across workers, SIGKILL-race around `docker kill` crash gap, rollback/failed-first-deploy
-  cleanup against real Docker, a seeded-baseline demonstration of the regression.
+- Unit interruption checks fail the journal write after restart-policy update, signal delivery, and KILL delivery. Recovery
+  resumes from the saved intent, preserves the original deadline, and does not send `KILL` for a `fail` policy.
+- Not done: killing a real worker at every stop phase, the marked real 120-second drain test (short delays used), the
+  real Docker SIGKILL crash gap, rollback/failed-first-deploy cleanup against real Docker, and a seeded-baseline
+  demonstration of the regression.
 
 ## Not verified, and why
 

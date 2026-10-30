@@ -41,21 +41,39 @@ def policy(configuration: dict) -> tuple[int, str]:
             deploy.get("shutdown_timeout_action", DEFAULT_ACTION))
 
 
-def worst_case_seconds(candidate: dict, outgoing_timeout: int = DEFAULT_TIMEOUT_SECONDS) -> int:
-    """Longest one transaction can run: lock wait, pull, two stops, two readiness waits, and command overhead.
+def worst_case_seconds(candidate: dict, outgoing: dict | None = None) -> int:
+    """Bound a deploy or rollback using the actual outgoing and candidate releases."""
+    candidate_timeout, candidate_action = policy(candidate)
+    candidate_readiness = candidate["deploy"]["readiness_timeout_seconds"]
+    if outgoing is None:
+        outgoing_timeout, outgoing_action, outgoing_readiness = 0, "fail", 0
+    else:
+        outgoing_timeout, outgoing_action = policy(outgoing)
+        outgoing_readiness = outgoing["deploy"]["readiness_timeout_seconds"]
+    force_overhead = (FORCE_EXIT_SECONDS if candidate_action == "force" else 0)
+    force_overhead += FORCE_EXIT_SECONDS if outgoing_action == "force" and outgoing is not None else 0
+    return (LOCK_WAIT_SECONDS + PULL_SECONDS + outgoing_timeout + candidate_timeout + force_overhead
+            + candidate_readiness + outgoing_readiness + COMMAND_RESERVE_SECONDS)
 
-    The outgoing release's stop is bounded by its own recorded timeout; the candidate's stop (during restoration)
-    by the candidate's. A forced stop adds FORCE_EXIT_SECONDS to each.
-    """
-    own, _ = policy(candidate)
-    readiness = candidate["deploy"]["readiness_timeout_seconds"]
-    return (LOCK_WAIT_SECONDS + PULL_SECONDS + outgoing_timeout + own + 2 * FORCE_EXIT_SECONDS
-            + 2 * readiness + COMMAND_RESERVE_SECONDS)
 
-
-def check_budget(candidate: dict) -> None:
-    """Refuse an explicit policy whose worst case cannot finish inside the worker's lifetime."""
-    needed = worst_case_seconds(candidate, max(policy(candidate)[0], DEFAULT_TIMEOUT_SECONDS))
+def check_budget(candidate: dict, outgoing: dict | None = None) -> None:
+    """Refuse a transaction whose actual releases cannot fit inside the worker's lifetime."""
+    needed = worst_case_seconds(candidate, outgoing)
     if needed > MAX_JOB_SECONDS:
         raise ShutdownError(f"the worst-case deployment time ({needed}s) exceeds the {MAX_JOB_SECONDS}s job limit; "
                             "lower deploy.shutdown_timeout_seconds or deploy.readiness_timeout_seconds")
+
+
+def check_recovery_budget(candidate: dict, target: dict | None) -> None:
+    """Bound a separate recovery job using its saved candidate and reconciliation target."""
+    target_configuration = target["configuration"] if target is not None else None
+    candidate_configuration = candidate["configuration"]
+    possible = [configuration for configuration in (candidate_configuration, target_configuration) if configuration]
+    stop_timeout = max(policy(configuration)[0] for configuration in possible)
+    may_force = any(policy(configuration)[1] == "force" for configuration in possible)
+    target_readiness = (target_configuration["deploy"]["readiness_timeout_seconds"]
+                        if target_configuration is not None else 0)
+    needed = (LOCK_WAIT_SECONDS + PULL_SECONDS + stop_timeout + (FORCE_EXIT_SECONDS if may_force else 0)
+              + target_readiness + COMMAND_RESERVE_SECONDS)
+    if needed > MAX_JOB_SECONDS:
+        raise ShutdownError(f"the worst-case recovery time ({needed}s) exceeds the {MAX_JOB_SECONDS}s job limit")

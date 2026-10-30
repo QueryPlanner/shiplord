@@ -24,6 +24,8 @@ _ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\Z")
 _COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _IMAGE = re.compile(r"ghcr\.io/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+@sha256:[0-9a-f]{64}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_STOP_PHASES = ("intent", "restart_disabled", "signal_pending", "signalled", "kill_pending", "killed")
+_STOP_SIGNALS = re.compile(r"(?:SIG(?:HUP|INT|QUIT|USR1|USR2|TERM|ALRM|WINCH)|(?:[1-8]|1[0-8]|2[0-8]|3[01]))\Z")
 
 
 class StateError(ValueError):
@@ -106,8 +108,45 @@ def _state(value: object, app: str) -> dict:
     return value
 
 
+def _volume_provenance(value: object, app: str) -> dict | None:
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {"volume_name", "fingerprint", "container_id"}
+            or value.get("volume_name") != f"shiplord-{app}-artifacts"
+            or not isinstance(value.get("fingerprint"), str) or not _DIGEST.fullmatch(value["fingerprint"])
+            or not isinstance(value.get("container_id"), str) or not _DIGEST.fullmatch(value["container_id"])):
+        raise StateError("invalid legacy volume provenance")
+    return value
+
+
+def _stop_record(value: object) -> dict | None:
+    if value is None:
+        return None
+    required = {"container_id", "restart_policy", "timeout_seconds", "action", "signal", "deadline_epoch", "phase"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise StateError("invalid shutdown record")
+    if not isinstance(value["container_id"], str) or not _DIGEST.fullmatch(value["container_id"]):
+        raise StateError("invalid shutdown container ID")
+    if value["restart_policy"] not in ("always", "unless-stopped", "on-failure"):
+        raise StateError("invalid shutdown restart policy")
+    if type(value["timeout_seconds"]) is not int or not 1 <= value["timeout_seconds"] <= 300:
+        raise StateError("invalid shutdown timeout")
+    if value["action"] not in ("force", "fail"):
+        raise StateError("invalid shutdown action")
+    signal = value["signal"]
+    if not isinstance(signal, str) or not _STOP_SIGNALS.fullmatch(signal) or signal in ("9", "19"):
+        raise StateError("invalid shutdown signal")
+    if type(value["deadline_epoch"]) is not int or not 0 <= value["deadline_epoch"] <= 2**53:
+        raise StateError("invalid shutdown deadline")
+    if value["phase"] not in _STOP_PHASES:
+        raise StateError("invalid shutdown phase")
+    return value
+
+
 def _journal(value: object, app: str) -> dict:
-    if not isinstance(value, dict) or set(value) != {"schema_version", "request_id", "phase", "prior_state", "candidate"}:
+    required = {"schema_version", "request_id", "phase", "prior_state", "candidate"}
+    if (not isinstance(value, dict) or not required <= set(value)
+            or set(value) - required - {"storage_provenance", "stop"}):
         raise StateError("invalid transaction journal")
     if type(value["schema_version"]) is not int or value["schema_version"] != 1:
         raise StateError("incompatible transaction journal")
@@ -118,6 +157,8 @@ def _journal(value: object, app: str) -> dict:
     if request_id not in prior["seen_requests"] or request_id == prior["transaction_id"]:
         raise StateError("invalid transaction request history")
     _release(value["candidate"], app)
+    _volume_provenance(value.get("storage_provenance"), app)
+    _stop_record(value.get("stop"))
     return value
 
 
@@ -254,10 +295,11 @@ class ReleaseState:
         _write(self.directory, "state.json", {"schema_version": 1, "generation": 0,
                "transaction_id": None, "current": None, "previous": None, "seen_requests": []}, create=True)
 
-    def begin(self, request_id: str, candidate: dict) -> None:
+    def begin(self, request_id: str, candidate: dict, *, storage_provenance: dict | None = None) -> None:
         self._require_lock()
         request_id = _record_id(request_id)
         candidate = _release(candidate, self.app)
+        storage_provenance = _volume_provenance(storage_provenance, self.app)
         try:
             os.fsync(self.directory)
         except OSError:
@@ -274,8 +316,11 @@ class ReleaseState:
             del seen[next(i for i, value in enumerate(seen) if value != prior["transaction_id"])]
         prior = dict(prior, seen_requests=seen)
         _write(self.directory, "state.json", prior, create=False)
-        _write(self.directory, "journal.json", {"schema_version": 1, "request_id": request_id,
-               "phase": "prepared", "prior_state": prior, "candidate": candidate}, create=True)
+        journal = {"schema_version": 1, "request_id": request_id, "phase": "prepared",
+                   "prior_state": prior, "candidate": candidate}
+        if storage_provenance is not None:
+            journal["storage_provenance"] = storage_provenance
+        _write(self.directory, "journal.json", journal, create=True)
 
     def advance(self, phase: str) -> None:
         self._require_lock()
@@ -286,6 +331,34 @@ class ReleaseState:
         if index + 1 >= len(_PHASES) or _PHASES[index + 1] != phase:
             raise StateError("invalid transaction phase transition")
         journal["phase"] = phase
+        _write(self.directory, "journal.json", journal, create=False)
+
+    def write_stop(self, record: dict) -> None:
+        """Persist shutdown intent and progress before each Docker side effect."""
+        self._require_lock()
+        journal = self.read_journal()
+        if journal is None:
+            raise StateError("shutdown requires an active transaction")
+        record = _stop_record(record)
+        existing = _stop_record(journal.get("stop"))
+        if existing is not None:
+            identity = {key: value for key, value in existing.items() if key != "phase"}
+            updated_identity = {key: value for key, value in record.items() if key != "phase"}
+            if identity != updated_identity or _STOP_PHASES.index(record["phase"]) < _STOP_PHASES.index(existing["phase"]):
+                raise StateError("shutdown progress cannot move backwards or change containers")
+        journal["stop"] = record
+        _write(self.directory, "journal.json", journal, create=False)
+
+    def clear_stop(self, container_id: str) -> None:
+        """Clear shutdown intent only after the recorded container has exited and been removed."""
+        self._require_lock()
+        journal = self.read_journal()
+        if journal is None:
+            raise StateError("shutdown journal is missing")
+        record = _stop_record(journal.get("stop"))
+        if record is None or record["container_id"] != container_id:
+            raise StateError("shutdown record does not match the removed container")
+        del journal["stop"]
         _write(self.directory, "journal.json", journal, create=False)
 
     def record_commit(self) -> None:
@@ -315,6 +388,11 @@ class ReleaseState:
     def clear_after_reconciliation(self) -> None:
         """Remove the journal only after the caller verifies runtime and routing."""
         self._require_lock()
+        journal = self.read_journal()
+        if journal is None:
+            raise StateError("no transaction requires reconciliation")
+        if journal.get("stop") is not None:
+            raise StateError("shutdown intent must be reconciled before clearing the journal")
         self.reconciliation_target()
         try:
             os.unlink("journal.json", dir_fd=self.directory)

@@ -160,10 +160,15 @@ class RealDockerDeployTests(unittest.TestCase):
         images = {}
         for version, mode, commit in (("v1", "healthy", "a"), ("v2", "healthy", "b"), ("v3", "unhealthy", "c"),
                                       ("v4", "crash", "d"), ("v5", "healthy", "e"),
-                                      ("v6", "graceful", "f"), ("v7", "ignore", "7"), ("v8", "healthy", "8")):
+                                      ("v6", "graceful", "f"), ("v7", "ignore", "7"), ("v8", "healthy", "8"),
+                                      ("v6-volume", "healthy", "9")):
             tag = f"{REPOSITORY}:{version}"
+            dockerfile = context / "Dockerfile"
+            if version == "v6-volume":
+                dockerfile = context / "Dockerfile.volume"
+                dockerfile.write_text(DOCKERFILE.replace("USER app", "VOLUME /scratch\nUSER app"))
             docker("build", "-q", "--build-arg", f"VERSION={version}", "--build-arg", f"MODE={mode}", "--build-arg",
-                   f"REVISION={commit * 40}", "-t", tag, str(context))
+                   f"REVISION={commit * 40}", "-f", str(dockerfile), "-t", tag, str(context))
             pushed = docker("push", tag).stdout
             digest = re.search(r"digest: (sha256:[0-9a-f]{64})", pushed).group(1)
             docker("rmi", tag, check=False)
@@ -174,9 +179,16 @@ class RealDockerDeployTests(unittest.TestCase):
     @classmethod
     def remove_app_resources(cls):
         ids = docker("ps", "-aq", "--filter", f"label=shiplord.app={cls.app}", check=False).stdout.split()
+        image_volumes = set()
         if ids:
+            for container in json.loads(docker("inspect", *ids, check=False).stdout or "[]"):
+                image_volumes.update(mount["Name"] for mount in container.get("Mounts", [])
+                                     if mount.get("Destination") == "/scratch" and mount.get("Type") == "volume"
+                                     and mount.get("Name"))
             docker("rm", "-f", *ids, check=False)
         docker("volume", "rm", "-f", f"shiplord-{cls.app}-artifacts", check=False)
+        for name in image_volumes:
+            docker("volume", "rm", name, check=False)
         for image in cls.images.values():
             docker("rmi", image["image"], check=False)
 
@@ -460,6 +472,14 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertIsNone(self.state.read_journal())
         self.assertEqual(self.get("/version"), "v7")
         self.assertEqual(len(self.containers()), 1)
+    def test_z_image_declared_volume_does_not_break_readiness_or_release_identity(self):
+        deployed = self.deploy("req-v6", "v6-volume", 5002)
+        self.assertOutcome(deployed, "succeeded")
+        inspected = self.inspect()
+        mounts = {(mount["Name"], mount["Destination"]) for mount in inspected["Mounts"]}
+        self.assertIn((f"shiplord-{self.app}-artifacts", "/app/src/.adk"), mounts)
+        self.assertTrue(any(destination == "/scratch" for _, destination in mounts))
+        self.assertTrue(self.runtime.is_running(self.registration, self.state.read_state()["current"]))
 
     def runtime_rollback(self, request_id):
         with self.lock.acquire():

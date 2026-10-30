@@ -241,11 +241,11 @@ def require_feature_support(manifest: dict, client: HelperClient) -> None:
 
 
 def job_timeout(manifest: dict) -> float:
-    """How long the client waits for a job: readiness plus the old fixed allowance, plus both possible stops."""
-    from .shutdown import FORCE_EXIT_SECONDS, policy
-    timeout, _ = policy(manifest)
-    stops = 2 * (max(timeout, 10) + FORCE_EXIT_SECONDS) if manifest["runtime"] == "docker" else 0
-    return manifest["deploy"]["readiness_timeout_seconds"] + 900 + (stops if uses_shutdown_policy(manifest) else 0)
+    """Wait through the server's full Docker job bound, since stored releases are not in the local manifest."""
+    if manifest["runtime"] == "docker":
+        from .shutdown import MAX_JOB_SECONDS
+        return MAX_JOB_SECONDS + 30  # leave time to read the job result after the worker's hard limit
+    return manifest["deploy"]["readiness_timeout_seconds"] + 900
 
 
 def deploy_application(manifest: dict, client: HelperClient, *, image: str | None = None, binary: Path | None = None,
