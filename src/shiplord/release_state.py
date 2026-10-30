@@ -106,8 +106,21 @@ def _state(value: object, app: str) -> dict:
     return value
 
 
+def _volume_provenance(value: object, app: str) -> dict | None:
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {"volume_name", "fingerprint", "container_id"}
+            or value.get("volume_name") != f"shiplord-{app}-artifacts"
+            or not isinstance(value.get("fingerprint"), str) or not _DIGEST.fullmatch(value["fingerprint"])
+            or not isinstance(value.get("container_id"), str) or not _DIGEST.fullmatch(value["container_id"])):
+        raise StateError("invalid legacy volume provenance")
+    return value
+
+
 def _journal(value: object, app: str) -> dict:
-    if not isinstance(value, dict) or set(value) != {"schema_version", "request_id", "phase", "prior_state", "candidate"}:
+    required = {"schema_version", "request_id", "phase", "prior_state", "candidate"}
+    if (not isinstance(value, dict) or not required <= set(value)
+            or set(value) - required - {"storage_provenance"}):
         raise StateError("invalid transaction journal")
     if type(value["schema_version"]) is not int or value["schema_version"] != 1:
         raise StateError("incompatible transaction journal")
@@ -118,6 +131,7 @@ def _journal(value: object, app: str) -> dict:
     if request_id not in prior["seen_requests"] or request_id == prior["transaction_id"]:
         raise StateError("invalid transaction request history")
     _release(value["candidate"], app)
+    _volume_provenance(value.get("storage_provenance"), app)
     return value
 
 
@@ -254,10 +268,11 @@ class ReleaseState:
         _write(self.directory, "state.json", {"schema_version": 1, "generation": 0,
                "transaction_id": None, "current": None, "previous": None, "seen_requests": []}, create=True)
 
-    def begin(self, request_id: str, candidate: dict) -> None:
+    def begin(self, request_id: str, candidate: dict, *, storage_provenance: dict | None = None) -> None:
         self._require_lock()
         request_id = _record_id(request_id)
         candidate = _release(candidate, self.app)
+        storage_provenance = _volume_provenance(storage_provenance, self.app)
         try:
             os.fsync(self.directory)
         except OSError:
@@ -274,8 +289,11 @@ class ReleaseState:
             del seen[next(i for i, value in enumerate(seen) if value != prior["transaction_id"])]
         prior = dict(prior, seen_requests=seen)
         _write(self.directory, "state.json", prior, create=False)
-        _write(self.directory, "journal.json", {"schema_version": 1, "request_id": request_id,
-               "phase": "prepared", "prior_state": prior, "candidate": candidate}, create=True)
+        journal = {"schema_version": 1, "request_id": request_id, "phase": "prepared",
+                   "prior_state": prior, "candidate": candidate}
+        if storage_provenance is not None:
+            journal["storage_provenance"] = storage_provenance
+        _write(self.directory, "journal.json", journal, create=True)
 
     def advance(self, phase: str) -> None:
         self._require_lock()

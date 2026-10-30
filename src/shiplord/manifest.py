@@ -8,6 +8,8 @@ import tomllib
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .storage import StorageError, validate_storage
+
 
 class ManifestError(ValueError):
     """A manifest cannot be used safely."""
@@ -101,7 +103,7 @@ def load_manifest(path: Path = Path("ship.toml")) -> dict:
 def validate_manifest(raw: dict) -> dict:
     """Validate parsed manifest data and return its nonsecret configuration."""
 
-    root = _table(raw, "manifest", {"schema_version", "name", "server", "template", "runtime", "http", "resources", "deploy", "github"})
+    root = _table(raw, "manifest", {"schema_version", "name", "server", "template", "runtime", "http", "resources", "deploy", "github", "storage"})
     if type(root.get("schema_version")) is not int or root["schema_version"] != 1:
         raise ManifestError("schema_version must be 1")
     name = validate_app_name(root.get("name"))
@@ -137,6 +139,13 @@ def validate_manifest(raw: dict) -> dict:
     result = {"schema_version": 1, "name": name, "server": server, "template": template, "runtime": runtime,
             "http": {"api_domain": domain, "frontend_origins": validated_origins, "container_port": port, "readiness_path": readiness},
             "resources": {"memory_mb": memory}, "deploy": {"readiness_timeout_seconds": timeout, "retain_successful_releases": retain}}
+    if "storage" in root:
+        if runtime != "docker":
+            raise ManifestError("storage applies only to Docker applications")
+        try:
+            result["storage"] = validate_storage(root["storage"])
+        except StorageError as error:
+            raise ManifestError(str(error)) from None
     if "github" in root:
         github = _table(root["github"], "github", {"repository", "deployment_branch"})
         repository = _string(github.get("repository"), "github.repository")

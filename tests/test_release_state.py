@@ -102,6 +102,28 @@ class ReleaseStateTests(unittest.TestCase):
             self.store.begin("native-1", candidate)
         self.assertEqual(self.store.read_journal()["candidate"]["artifact"], candidate["artifact"])
 
+    def test_legacy_volume_provenance_is_validated_and_persisted_in_the_journal(self):
+        provenance = {"volume_name": "shiplord-orders-artifacts", "fingerprint": "a" * 64,
+                      "container_id": "b" * 64}
+        with self.lock.acquire():
+            self.store.begin("request-1", release(), storage_provenance=provenance)
+            self.assertEqual(self.store.read_journal()["storage_provenance"], provenance)
+
+        with self.lock.acquire():
+            self.store.clear_after_reconciliation()
+            with self.assertRaises(StateError):
+                self.store.begin("request-2", release(), storage_provenance={"volume_name": "shiplord-billing-artifacts",
+                                                                              "fingerprint": "a" * 64,
+                                                                              "container_id": "b" * 64})
+            self.assertIsNone(self.store.read_journal())
+
+    def test_a_legacy_journal_without_volume_provenance_remains_readable(self):
+        with self.lock.acquire():
+            self.store.begin("request-1", release())
+            journal = json.loads((self.directory / "journal.json").read_text())
+            self.assertNotIn("storage_provenance", journal)
+            self.assertIsNone(self.store.read_journal().get("storage_provenance"))
+
     def test_corrupt_or_unsafe_state_fails_closed(self):
         state = self.directory / "state.json"
         for content in ('{"schema_version":1,"schema_version":1}', '[]', '{"schema_version":2}', 'x' * 65537):

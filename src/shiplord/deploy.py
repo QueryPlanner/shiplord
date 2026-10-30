@@ -18,6 +18,7 @@ from .registry import validate_registration
 from .release_state import ReleaseState, StateError, validate_release
 from .routing import RouteManager, RoutingError
 from .runtime import Runtime, RuntimeFailure, release_id
+from .storage import container_path
 
 MAX_FUTURE_SECONDS = 24 * 3600  # clock skew allowance; a far-future sequence would otherwise freeze the application
 SUCCESS = {"succeeded", "unchanged", "already_applied", "recovered", "nothing_to_recover"}
@@ -76,6 +77,9 @@ class Deployer:
             raise StateError("the artifact kind does not match the registered runtime")
         if candidate["configuration"]["http"]["api_domain"] != registration["api_domain"]:
             raise StateError("the hostname differs from the registration; changing it needs an administrator")
+        if "owner_uid" in candidate["configuration"].get("storage", {}):
+            # The initializer that would establish ownership needs a pinned, reviewed image that does not exist yet.
+            raise StateError("storage ownership (owner_uid/owner_gid) is not supported by this helper yet")
         if candidate["artifact"]["kind"] == "docker":
             if candidate["artifact"]["image"].split("@", 1)[0] != registration["image_repository"]:
                 raise StateError("the image repository is not the one registered for this application")
@@ -147,7 +151,13 @@ class Deployer:
         if current == candidate and self.runtime.is_running(self.registration, current) \
                 and self.probes.ready_once(self.registration, current):
             return {"action": "unchanged", **base}
-        return {"action": "deploy", "restarts_application": current is not None,
+        storage = {}
+        if candidate["artifact"]["kind"] == "docker":
+            old, new = (container_path(current["configuration"]) if current else None), container_path(candidate["configuration"])
+            storage = {"storage": {"current_path": old, "candidate_path": new, "same_volume": True,
+                                   "note": "the application's single volume is mounted at the candidate path; no files are moved "
+                                           "and no data is migrated" if old not in (None, new) else "no path change"}}
+        return {"action": "deploy", "restarts_application": current is not None, **storage,
                 "route_change": {"absent": "create", "different": "replace", "identical": "none"}[route], **base}
 
     def rollback(self, request_id: str) -> Outcome:
@@ -199,14 +209,15 @@ class Deployer:
         except RuntimeFailure as failure:  # nothing has changed yet
             return Outcome("failed", 1, {"error": "prepare_failed", "restored": True, **self._describe(failure),
                                          "warnings": self._abandon(candidate, before)})
+        storage_provenance = prepared.pop("storage_provenance", None)
         try:
-            self.state.begin(request_id, candidate)
+            self.state.begin(request_id, candidate, storage_provenance=storage_provenance)
         except StateError as error:
             return Outcome("failed", 1, {"error": "journal_unavailable", "message": str(error)})
         probes: dict = {}
         try:
             self._advance("runtime-changing")
-            self.runtime.start(self.registration, candidate)
+            self._start_runtime(candidate, storage_provenance)
             probes["local_ready"] = self.probes.wait_ready(
                 self.registration, candidate, alive=lambda: self.runtime.is_running(self.registration, candidate))
             self._advance("runtime-ready")
@@ -239,6 +250,14 @@ class Deployer:
         self.progress(phase, {})
         self.state.advance(phase)
 
+    def _start_runtime(self, release: dict, storage_provenance: dict | None = None) -> None:
+        if storage_provenance is not None:
+            start_with_provenance = getattr(self.runtime, "start_with_provenance", None)
+            if start_with_provenance is not None:
+                start_with_provenance(self.registration, release, storage_provenance)
+                return
+        self.runtime.start(self.registration, release)
+
     def _retire(self, before: dict, candidate: dict) -> list[str]:
         """After success, drop the image of the release that left the two-release retention window."""
         dropped = before["previous"]
@@ -252,13 +271,15 @@ class Deployer:
 
     def _reconcile(self, target: dict | None, *, route: bool) -> None:
         """Make the runtime and routing match ``target`` (None means no release at all)."""
+        journal = self.state.read_journal()
+        storage_provenance = None if journal is None else journal.get("storage_provenance")
         if target is None:
             self.runtime.stop(self.registration)
             if route:
                 self.routes.reconcile(self.app, None)
             return
         if not (self.runtime.is_running(self.registration, target) and self.probes.ready_once(self.registration, target)):
-            self.runtime.start(self.registration, target)
+            self._start_runtime(target, storage_provenance)
             self.probes.wait_ready(self.registration, target,
                                    alive=lambda: self.runtime.is_running(self.registration, target))
         if route:

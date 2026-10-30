@@ -17,6 +17,7 @@ from .client import AdminClient, ClientError, HelperClient, new_request_id, subm
 from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
 from .runtime import RuntimeFailure
+from .storage import FEATURE as STORAGE_FEATURE
 from .protocol import PROTOCOL_VERSION
 
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
@@ -221,6 +222,15 @@ def validate_deploy_inputs(manifest: dict, artifact: str | Path, commit: str) ->
     return resolved
 
 
+def require_storage_support(manifest: dict, client: HelperClient) -> None:
+    """Refuse explicit storage settings on a helper that would ignore them, before any job exists."""
+    if "storage" not in manifest:
+        return
+    if STORAGE_FEATURE not in client.call("capabilities")["actions"]:
+        raise CommandError("the server helper does not support [storage]; re-run `shiplord server bootstrap` "
+                           "to upgrade it, then retry", 4)
+
+
 def deploy_application(manifest: dict, client: HelperClient, *, image: str | None = None, binary: Path | None = None,
                        commit: str, sequence: int, request_id: str | None = None, timeout: float | None = None, allow_older: bool = False,
                        on_progress: Callable[[str], None] = lambda phase: None, verify_public: bool = True,
@@ -229,6 +239,7 @@ def deploy_application(manifest: dict, client: HelperClient, *, image: str | Non
         raise CommandError("specify exactly one of --image and --binary")
     artifact = validate_deploy_inputs(manifest, binary if binary is not None else image, commit)
     arguments = _deploy_arguments(manifest, artifact, sequence, allow_older)
+    require_storage_support(manifest, client)
     request_id = request_id or new_request_id("deploy")
     timeout = timeout or manifest["deploy"]["readiness_timeout_seconds"] + 900
     outcome = submit_and_wait(client, "deploy", request_id=request_id, commit=commit, arguments=arguments,
@@ -252,6 +263,7 @@ def plan_application(manifest: dict, client: HelperClient, *, image: str | None 
         raise CommandError("specify exactly one of --image and --binary")
     artifact = validate_deploy_inputs(manifest, binary if binary is not None else image, commit)
     arguments = _deploy_arguments(manifest, artifact, sequence, allow_older)
+    require_storage_support(manifest, client)
     response = client.call("plan", request_id=new_request_id("plan"), commit=commit, arguments=arguments)
     return 0, {"ok": True, "scope": "server plan; nothing was changed", **response["result"]}
 

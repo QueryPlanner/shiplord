@@ -84,6 +84,32 @@ x86-64 and arm64 are supported), for example in CI. The binary is uploaded over 
 verified by size, SHA-256 and ELF header on the server, and run as an unprivileged account under a confined
 systemd unit.
 
+## Persistent storage (Docker)
+
+Each Docker application has one named volume, `shiplord-<application>-artifacts`, mounted at `/app/src/.adk` by
+default. To mount it elsewhere, add a table to `ship.toml`:
+
+```toml
+[storage]
+container_path = "/data"
+```
+
+The path must be a canonical absolute directory path (letters, digits, `.`, `_`, `-`; no `..`, trailing or repeated
+slashes), and may not be, or be inside, `/proc`, `/sys`, `/dev`, `/run`, `/etc`, `/bin`, `/sbin`, `/usr`, `/lib`,
+`/lib64`, `/boot`, `/root`, `/var/run` or `/var/lock`. Native applications reject `[storage]`.
+
+- Changing the path mounts the **same** volume at the new location. No files move and nothing is migrated:
+  relative file names, including SQLite databases, stay where they were. `shiplord plan` shows the old and new path.
+- A mount can hide files the image keeps at that path; check the destination against your image.
+- Rollback restores the path the earlier release recorded. It does not roll back data, permissions or schema.
+- Shiplord refuses a volume that is not a plain local volume labelled for the application. It creates the volume on
+  the first deploy (never during `plan`) and never removes it.
+- Using `[storage]` needs a helper that advertises `docker_storage_v1`; a newer CLI refuses to submit it to an
+  older helper (re-run `shiplord server bootstrap`). A helper must not be downgraded after deploying records that
+  use `[storage]`.
+- `owner_uid` / `owner_gid` are validated but **not yet supported**: the helper rejects them, because establishing
+  ownership safely needs a pinned initializer image that has not been built and reviewed.
+
 ## Deploying from GitHub Actions
 
 ```sh

@@ -46,6 +46,11 @@ application is denied (`{"status": "error", "error": "access_denied"}`, exit 3).
 | `rollback` | null | none | `accepted` with a job |
 | `recover` | null | none | `accepted` with a job |
 
+`capabilities` lists optional features after the actions in the same `actions` array (an older client rejects unknown
+response fields but accepts any extra name). `docker_storage_v1` means the helper honours `[storage]` in a Docker
+`configuration`; it validates `storage.container_path` itself, independent of the client. `plan` adds
+`storage: {current_path, candidate_path, same_volume, note}` for Docker applications.
+
 Arguments are validated before any host state is opened. `artifact` is `{"kind": "docker", "image":
 "registry/name@sha256:<64 hex>"}` (the repository must equal the registered one) or `{"kind": "native", "sha256",
 "size", "architecture"}`. `configuration` is a complete `ship.toml` as JSON; its hostname must equal the registered

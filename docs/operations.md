@@ -49,6 +49,16 @@ application's state including any unfinished transaction.
 | Restoration itself fails | Exit 6; journal stays. | `shiplord recover`, then investigate. |
 | Client disconnects | The job continues. | `shiplord status`. |
 
+Storage: the application volume is never removed by deploy, rollback, recover, retirement or retention. If a deploy is
+refused with phase `storage`, the volume has another driver, driver options, another application's label, or no retained
+Shiplord container proving that an unlabelled legacy volume belongs to this application. Inspect it with
+`docker volume inspect` as an administrator and resolve it deliberately. A running container is recognised only when
+its image digest and exactly one Shiplord volume mount match the release. Extra image-declared mounts are allowed, so an
+image `VOLUME` instruction does not make a healthy release appear absent.
+
+An unfinished transaction may include a legacy-volume proof in its journal. Recover that transaction before
+downgrading the helper, because an older helper cannot read the added journal field.
+
 A real reboot is not part of the automated tests. Docker containers use `--restart unless-stopped` and native
 units are enabled, but behavior after a power loss has not been verified.
 
