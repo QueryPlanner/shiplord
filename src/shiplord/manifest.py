@@ -8,6 +8,7 @@ import tomllib
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .shutdown import ShutdownError, validate_action, validate_timeout
 from .storage import StorageError, validate_storage
 
 
@@ -132,13 +133,22 @@ def validate_manifest(raw: dict) -> dict:
 
     resources = _table(root.get("resources"), "resources", {"memory_mb"})
     memory = _integer(resources.get("memory_mb"), "resources.memory_mb", 1, 1048576)
-    deploy = _table(root.get("deploy"), "deploy", {"readiness_timeout_seconds", "retain_successful_releases"})
+    deploy = _table(root.get("deploy"), "deploy", {"readiness_timeout_seconds", "retain_successful_releases",
+                                                   "shutdown_timeout_seconds", "shutdown_timeout_action"})
     timeout = _integer(deploy.get("readiness_timeout_seconds"), "deploy.readiness_timeout_seconds", 1, 900)
     retain = _integer(deploy.get("retain_successful_releases"), "deploy.retain_successful_releases", 2, 2)
     # Only the current and the previous release are kept (rollback needs exactly those), so other values would mislead.
     result = {"schema_version": 1, "name": name, "server": server, "template": template, "runtime": runtime,
             "http": {"api_domain": domain, "frontend_origins": validated_origins, "container_port": port, "readiness_path": readiness},
             "resources": {"memory_mb": memory}, "deploy": {"readiness_timeout_seconds": timeout, "retain_successful_releases": retain}}
+    for field, check in (("shutdown_timeout_seconds", validate_timeout), ("shutdown_timeout_action", validate_action)):
+        if field in deploy:
+            if runtime != "docker":
+                raise ManifestError(f"deploy.{field} applies only to Docker applications")
+            try:
+                result["deploy"][field] = check(deploy[field])
+            except ShutdownError as error:
+                raise ManifestError(str(error)) from None
     if "storage" in root:
         if runtime != "docker":
             raise ManifestError("storage applies only to Docker applications")

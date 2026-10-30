@@ -122,7 +122,39 @@ class ReleaseStateTests(unittest.TestCase):
             self.store.begin("request-1", release())
             journal = json.loads((self.directory / "journal.json").read_text())
             self.assertNotIn("storage_provenance", journal)
+            self.assertNotIn("stop", journal)
             self.assertIsNone(self.store.read_journal().get("storage_provenance"))
+
+    def test_shutdown_intent_is_validated_persisted_and_cleared_only_after_exit(self):
+        record = {"container_id": "b" * 64, "restart_policy": "unless-stopped", "timeout_seconds": 30,
+                  "action": "force", "signal": "SIGTERM", "deadline_epoch": 1_800_000_000, "phase": "intent"}
+        phases = ("restart_disabled", "signal_pending", "signalled", "kill_pending", "killed")
+        with self.lock.acquire():
+            self.store.begin("request-1", release())
+            self.store.write_stop(record)
+            self.assertEqual(self.store.read_journal()["stop"], record)
+            with self.assertRaisesRegex(StateError, "shutdown intent"):
+                self.store.clear_after_reconciliation()
+            for phase in phases:
+                record = dict(record, phase=phase)
+                self.store.write_stop(record)
+            with self.assertRaisesRegex(StateError, "move backwards"):
+                self.store.write_stop(dict(record, phase="signalled"))
+            self.store.clear_stop("b" * 64)
+            self.assertNotIn("stop", self.store.read_journal())
+            self.store.clear_after_reconciliation()
+
+    def test_invalid_shutdown_intent_is_rejected_without_changing_the_journal(self):
+        valid = {"container_id": "b" * 64, "restart_policy": "unless-stopped", "timeout_seconds": 30,
+                 "action": "force", "signal": "SIGTERM", "deadline_epoch": 1_800_000_000, "phase": "intent"}
+        invalid = (dict(valid, container_id="short"), dict(valid, signal="KILL"), dict(valid, timeout_seconds=True),
+                   dict(valid, phase="unknown"), dict(valid, deadline_epoch=-1))
+        with self.lock.acquire():
+            self.store.begin("request-1", release())
+            for record in invalid:
+                with self.subTest(record=record), self.assertRaises(StateError):
+                    self.store.write_stop(record)
+            self.assertNotIn("stop", self.store.read_journal())
 
     def test_corrupt_or_unsafe_state_fails_closed(self):
         state = self.directory / "state.json"

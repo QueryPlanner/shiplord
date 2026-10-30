@@ -56,8 +56,18 @@ Shiplord container proving that an unlabelled legacy volume belongs to this appl
 its image digest and exactly one Shiplord volume mount match the release. Extra image-declared mounts are allowed, so an
 image `VOLUME` instruction does not make a healthy release appear absent.
 
-An unfinished transaction may include a legacy-volume proof in its journal. Recover that transaction before
-downgrading the helper, because an older helper cannot read the added journal field.
+An unfinished transaction may include a legacy-volume proof or a shutdown record in its journal. Recover that
+transaction before downgrading the helper, because an older helper cannot read these added journal fields. Older
+journals without these fields remain readable.
+
+Shutdown intent and each stop step are synced to the transaction journal before Shiplord changes restart policy, sends
+a signal, or sends `KILL`. Recovery uses the saved container ID and deadline. A crash after Docker accepted a signal but
+before Shiplord recorded that result can cause recovery to send that signal again. Stop signals therefore have
+at-least-once delivery across worker crashes.
+
+A `fail`-policy deadline exits 6 with `kind: shutdown_timeout`; Shiplord never sends `KILL` for that policy. The original
+container keeps running with its restart policy set to `no`, and the journal remains available. After it exits,
+`shiplord recover` restores the committed release. If recovery reports `shutdown_timeout`, the process is still draining.
 
 A real reboot is not part of the automated tests. Docker containers use `--restart unless-stopped` and native
 units are enabled, but behavior after a power loss has not been verified.

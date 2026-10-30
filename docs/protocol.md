@@ -51,6 +51,10 @@ response fields but accepts any extra name). `docker_storage_v1` means the helpe
 `configuration`; it validates `storage.container_path` itself, independent of the client. `plan` adds
 `storage: {current_path, candidate_path, same_volume, note}` for Docker applications.
 
+`docker_shutdown_v1` means the helper honours `deploy.shutdown_timeout_seconds` / `shutdown_timeout_action`. `plan` adds
+`shutdown: {outgoing_policy, candidate_policy, note}`, and a finished deploy may include `shutdown` stage reports
+(`stop_requested`, `signalled`, `waiting`, `exited`, `forced`, `deadline_expired`).
+
 Arguments are validated before any host state is opened. `artifact` is `{"kind": "docker", "image":
 "registry/name@sha256:<64 hex>"}` (the repository must equal the registered one) or `{"kind": "native", "sha256",
 "size", "architecture"}`. `configuration` is a complete `ship.toml` as JSON; its hostname must equal the registered
