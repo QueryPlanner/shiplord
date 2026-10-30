@@ -26,7 +26,9 @@ def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=
     return value
 
 
-LEGACY_VOLUME = CommandResult(0, "local|null|null\n")
+LEGACY_VOLUME = CommandResult(0, "local|null|null|2026-10-30T00:00:00Z|/var/lib/docker/volumes/shiplord-orders-artifacts/_data\n")
+LABELLED_VOLUME = CommandResult(0, 'local|null|{"shiplord.app":"orders"}|2026-10-30T00:00:00Z|'
+                               '/var/lib/docker/volumes/shiplord-orders-artifacts/_data\n')
 REGISTRATION = {"application_id": "orders", "host_port": 20007, "api_domain": "orders.example.com"}
 
 
@@ -56,7 +58,7 @@ class RuntimeTestCase(unittest.TestCase):
         self.layout = Layout(Path(self.temp.name).resolve())
         (self.layout.environments / "orders").mkdir(parents=True)
         self.docker = FakeDocker()
-        self.docker.results["volume inspect"] = LEGACY_VOLUME  # an existing volume from before labels existed
+        self.docker.results["volume inspect"] = LABELLED_VOLUME
         self.runtime = DockerRuntime(self.docker, self.layout, platform_name="linux/amd64")
 
 
@@ -109,6 +111,9 @@ class PrepareTests(RuntimeTestCase):
         self.assertTrue(all("--config" not in call for call in self.docker.calls))
         other = dict(REGISTRATION, application_id="billing")  # another application has no login and uses none
         self.docker.calls.clear()
+        self.docker.results["volume inspect"] = CommandResult(
+            0, 'local|null|{"shiplord.app":"billing"}|2026-10-30T00:00:00Z|'
+               '/var/lib/docker/volumes/shiplord-billing-artifacts/_data\n')
         self.runtime.prepare(other, release())
         self.assertNotIn("--config", self.docker.calls[0])
 
@@ -189,7 +194,7 @@ class StartTests(RuntimeTestCase):
                                    ("run", CommandResult(125, "bad flag"), "start")):
             with self.subTest(key):
                 self.docker.calls.clear()
-                self.docker.results = {"volume inspect": LEGACY_VOLUME, "ps": CommandResult(0, ID_A + "\n"), key: result}
+                self.docker.results = {"volume inspect": LABELLED_VOLUME, "ps": CommandResult(0, ID_A + "\n"), key: result}
                 with self.assertRaises(RuntimeFailure) as caught:
                     self.runtime.start(REGISTRATION, release())
                 self.assertEqual(caught.exception.phase, phase)
@@ -229,12 +234,18 @@ class InspectTests(RuntimeTestCase):
                  "old mount path": self.inspect_output(mounts=("volume:shiplord-orders-artifacts:/data",)),
                  "another volume": self.inspect_output(mounts=("volume:shiplord-other-artifacts:/app/src/.adk",)),
                  "a bind mount": self.inspect_output(mounts=("bind::/app/src/.adk",)),
-                 "an extra mount": self.inspect_output(mounts=("volume:shiplord-orders-artifacts:/app/src/.adk", "volume:x:/y")),
+                 "a duplicate Shiplord mount": self.inspect_output(mounts=("volume:shiplord-orders-artifacts:/app/src/.adk",
+                                                                             "volume:shiplord-orders-artifacts:/app/src/.adk")),
                  "no mount": self.inspect_output(mounts=())}
         for label, result in wrong.items():
             with self.subTest(label):
                 self.docker.results["inspect"] = result
                 self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_an_image_declared_volume_does_not_hide_the_shiplord_mount(self):
+        self.docker.results["inspect"] = self.inspect_output(
+            mounts=("volume:shiplord-orders-artifacts:/app/src/.adk", "volume::/scratch"))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
 
     def test_a_registry_alias_does_not_change_the_identity_but_a_digest_does(self):
         mirrored = CommandResult(0, "true false localhost:5000/example/orders@sha256:" + "b" * 64
@@ -295,8 +306,15 @@ class StorageMountTests(RuntimeTestCase):
         self.assertEqual(self.docker.sub("volume create"), [])
 
     def test_a_foreign_or_unexplained_volume_is_refused_before_any_container_is_touched(self):
-        bad = {"another driver": "nfs|null|null", "driver options": 'local|{"device":"/etc"}|null',
-               "another application's label": 'local|null|{"shiplord.app":"billing"}', "garbage": "nonsense"}
+        bad = {"another driver": "nfs|null|null|2026-10-30T00:00:00Z|/var/lib/docker/volumes/x/_data",
+               "driver options": 'local|{"device":"/etc"}|null|2026-10-30T00:00:00Z|/var/lib/docker/volumes/x/_data',
+               "another application's label": 'local|null|{"shiplord.app":"billing"}|2026-10-30T00:00:00Z|'
+                                                '/var/lib/docker/volumes/x/_data',
+               "unrelated volume labels": 'local|null|{"owner":"manual"}|2026-10-30T00:00:00Z|'
+                                            '/var/lib/docker/volumes/shiplord-orders-artifacts/_data',
+               "unexplained same-name volume": "local|null|null|2026-10-30T00:00:00Z|"
+                                                "/var/lib/docker/volumes/shiplord-orders-artifacts/_data",
+               "garbage": "nonsense"}
         for label, output in bad.items():
             with self.subTest(label):
                 self.docker.calls.clear()
@@ -313,8 +331,43 @@ class StorageMountTests(RuntimeTestCase):
         self.assertEqual(self.docker.sub("volume create"), [])
 
     def test_a_labelled_volume_of_this_application_is_accepted(self):
-        self.docker.results["volume inspect"] = CommandResult(0, 'local|{}|{"shiplord.app":"orders"}')
+        self.docker.results["volume inspect"] = LABELLED_VOLUME
         self.run_argv()
+
+    def test_a_legacy_volume_needs_a_retained_shiplord_container_and_returns_durable_proof(self):
+        self.docker.results["volume inspect"] = LEGACY_VOLUME
+        self.docker.results["ps"] = CommandResult(0, ID_A + "\n")
+        release_id = "a" * 12
+        self.docker.results["inspect"] = CommandResult(
+            0, f"/shiplord-orders-{release_id}|orders|{release_id}|"
+               "volume:shiplord-orders-artifacts:/app/src/.adk\n")
+        self.docker.results["image inspect"] = CommandResult(0, "linux/amd64|\n")
+
+        prepared = self.runtime.prepare(REGISTRATION, release())
+        self.assertEqual(prepared["storage_provenance"]["volume_name"], "shiplord-orders-artifacts")
+        self.assertEqual(prepared["storage_provenance"]["container_id"], ID_A)
+        self.assertRegex(prepared["storage_provenance"]["fingerprint"], r"^[0-9a-f]{64}$")
+
+    def test_a_retained_container_proves_only_the_exact_expected_volume(self):
+        self.docker.results["volume inspect"] = LEGACY_VOLUME
+        self.docker.results["ps"] = CommandResult(0, ID_A + "\n")
+        release_id = "a" * 12
+        self.docker.results["inspect"] = CommandResult(
+            0, f"/shiplord-orders-{release_id}|orders|{release_id}|volume:shiplord-other-artifacts:/app/src/.adk\n")
+        with self.assertRaisesRegex(RuntimeFailure, "no retained Shiplord container evidence"):
+            self.runtime.check_volume(REGISTRATION, create=False)
+
+    def test_persisted_legacy_volume_proof_allows_recovery_after_the_container_is_gone(self):
+        import hashlib
+
+        self.docker.results["volume inspect"] = LEGACY_VOLUME
+        self.docker.results["ps"] = CommandResult(0, "")
+        created_at, mountpoint = "2026-10-30T00:00:00Z", "/var/lib/docker/volumes/shiplord-orders-artifacts/_data"
+        proof = {"volume_name": "shiplord-orders-artifacts",
+                 "fingerprint": hashlib.sha256((created_at + "\0" + mountpoint).encode()).hexdigest(),
+                 "container_id": ID_A}
+        self.runtime.start_with_provenance(REGISTRATION, release(), proof)
+        self.assertEqual(len(self.docker.sub("run")), 1)
 
     def test_removing_containers_never_removes_volumes(self):
         self.run_argv()

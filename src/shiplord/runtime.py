@@ -112,13 +112,18 @@ class DockerRuntime:
         revision = "" if revision == "<no value>" else revision
         if revision and revision != release["commit"]:
             raise RuntimeFailure("the image was built from a different commit than requested", "prepare")
-        self.check_volume(registration, create=False)  # read-only: a plan or a refused deploy creates nothing
-        return {"platform": image_platform, "revision_label": revision or None}
+        volume_provenance = self.check_volume(registration, create=False)  # read-only: a plan creates nothing
+        result = {"platform": image_platform, "revision_label": revision or None}
+        if volume_provenance is not None:
+            # The deployer persists this proof in the journal before replacing the retained container.
+            result["storage_provenance"] = volume_provenance
+        return result
 
-    def check_volume(self, registration: dict, *, create: bool) -> None:
-        """Accept only this application's plain local volume; optionally create it (never in a read-only plan)."""
+    def check_volume(self, registration: dict, *, create: bool, provenance: dict | None = None) -> dict | None:
+        """Accept this application's volume, with retained-container proof for legacy unlabelled volumes."""
         name = self.volume_name(registration)
-        inspect = self._docker(["volume", "inspect", "--format", "{{.Driver}}|{{json .Options}}|{{json .Labels}}", name],
+        inspect = self._docker(["volume", "inspect", "--format",
+                                "{{.Driver}}|{{json .Options}}|{{json .Labels}}|{{.CreatedAt}}|{{.Mountpoint}}", name],
                                "storage")
         if inspect.code != 0:
             if "no such volume" not in inspect.output.lower():
@@ -128,24 +133,65 @@ class DockerRuntime:
                                      f"shiplord.app={registration['application_id']}", name], "storage")
                 if made.code != 0:
                     raise RuntimeFailure("the application volume could not be created", "storage", made.output)
-            return
+            return None
         try:
-            driver, options, labels = inspect.output.strip().split("|", 2)
+            driver, options, labels, created_at, mountpoint = inspect.output.strip().split("|", 4)
             options, labels = json.loads(options) or {}, json.loads(labels) or {}
         except (ValueError, TypeError):
             raise RuntimeFailure("the application volume could not be understood", "storage") from None
-        if driver != "local" or options or not isinstance(labels, dict) or labels.get("shiplord.app", registration["application_id"]) != registration["application_id"]:
+        if (driver != "local" or options or not isinstance(labels, dict) or not created_at
+                or not mountpoint.startswith("/")):
+            raise RuntimeFailure("the application volume does not match what Shiplord manages; nothing was changed", "storage")
+        owner = labels.get("shiplord.app")
+        if owner == registration["application_id"]:
+            return None
+        if owner is not None or labels:
             raise RuntimeFailure("the application volume does not match what Shiplord manages; nothing was changed", "storage")
 
-    def _remove_containers(self, registration: dict) -> None:
-        listing = self._docker(["ps", "-aq", "--no-trunc", "--filter", f"label=shiplord.app={registration['application_id']}"],
-                               "stop")
+        fingerprint = hashlib.sha256((created_at + "\0" + mountpoint).encode()).hexdigest()
+        if (isinstance(provenance, dict) and provenance.get("volume_name") == name
+                and provenance.get("fingerprint") == fingerprint):
+            return provenance
+        retained = self._legacy_volume_container(registration, name)
+        if retained is None:
+            raise RuntimeFailure("the unlabelled application volume has no retained Shiplord container evidence", "storage")
+        return {"volume_name": name, "fingerprint": fingerprint, "container_id": retained}
+
+    def _legacy_volume_container(self, registration: dict, volume_name: str) -> str | None:
+        """Return a retained Shiplord container ID only when its labels and exact volume mount agree."""
+        for identifier in self._container_ids(registration, "storage"):
+            inspected = self._docker(["inspect", "--format",
+                                      "{{.Name}}|{{index .Config.Labels \"shiplord.app\"}}|"
+                                      "{{index .Config.Labels \"shiplord.release\"}}|"
+                                      "{{range .Mounts}}{{.Type}}:{{.Name}}:{{.Destination}} {{end}}", identifier],
+                                     "storage")
+            if inspected.code != 0:
+                raise RuntimeFailure("a retained container could not be inspected for volume provenance", "storage",
+                                     inspected.output)
+            try:
+                name, app_label, release_label, mounts = inspected.output.strip().split("|", 3)
+            except ValueError:
+                raise RuntimeFailure("a retained container could not be understood for volume provenance", "storage") from None
+            if (app_label == registration["application_id"]
+                    and len(release_label) == 12 and all(char in "0123456789abcdef" for char in release_label)
+                    and name.lstrip("/") == f"shiplord-{registration['application_id']}-{release_label}"
+                    and any(mount.startswith(f"volume:{volume_name}:") for mount in mounts.split())):
+                return identifier
+        return None
+
+    def _container_ids(self, registration: dict, phase: str) -> list[str]:
+        listing = self._docker(["ps", "-aq", "--no-trunc", "--filter",
+                                f"label=shiplord.app={registration['application_id']}"], phase)
         if listing.code != 0:
-            raise RuntimeFailure("existing containers could not be listed", "stop", listing.output)
+            raise RuntimeFailure("existing containers could not be listed", phase, listing.output)
         identifiers = listing.output.split()
-        for identifier in identifiers:
-            if len(identifier) != 64 or not all(c in "0123456789abcdef" for c in identifier):
-                raise RuntimeFailure("unexpected container listing", "stop")
+        if any(len(identifier) != 64 or any(char not in "0123456789abcdef" for char in identifier)
+               for identifier in identifiers):
+            raise RuntimeFailure("unexpected container listing", phase)
+        return identifiers
+
+    def _remove_containers(self, registration: dict) -> None:
+        identifiers = self._container_ids(registration, "stop")
         if identifiers:
             removal = self._docker(["rm", "--force", *identifiers], "stop")  # no -v: named volumes persist
             if removal.code != 0:
@@ -155,6 +201,13 @@ class DockerRuntime:
         self._remove_containers(registration)
 
     def start(self, registration: dict, release: dict) -> None:
+        self._start(registration, release)
+
+    def start_with_provenance(self, registration: dict, release: dict, provenance: dict) -> None:
+        """Start a release using legacy-volume proof persisted before its retained container was removed."""
+        self._start(registration, release, provenance)
+
+    def _start(self, registration: dict, release: dict, provenance: dict | None = None) -> None:
         """Replace whatever runs for this application with a container for ``release``."""
         config = release["configuration"]
         http = config["http"]
@@ -162,7 +215,7 @@ class DockerRuntime:
             custom = load_environment_file(self.layout.environments / registration["application_id"] / "app.env")
         except EnvironmentError_ as error:
             raise RuntimeFailure(f"the environment file is unusable: {error}", "start") from None
-        self.check_volume(registration, create=True)  # before the running release is touched
+        self.check_volume(registration, create=True, provenance=provenance)  # before the running release is touched
         self._remove_containers(registration)
         memory = f"{config['resources']['memory_mb']}m"
         argv = ["run", "--detach", "--name", self.container_name(registration, release),
@@ -203,8 +256,10 @@ class DockerRuntime:
             return False
         running, restarting, image, *mounts = fields
         expected = f"volume:{self.volume_name(registration)}:{container_path(release['configuration'])}"
+        # Docker adds one anonymous mount for every VOLUME instruction in an image. Those are compatible when the
+        # Shiplord-managed volume is still present exactly once at the configured path.
         return (running, restarting) == ("true", "false") and _digest(image) == _digest(release["artifact"]["image"]) \
-            and mounts == [expected]
+            and mounts.count(expected) == 1
 
     def logs(self, registration: dict, tail: int) -> str:
         tail = max(1, min(int(tail), MAX_LOG_LINES))
