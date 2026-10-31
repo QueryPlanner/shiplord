@@ -86,17 +86,23 @@ systemd unit.
 
 ## Existing Docker applications
 
-Use the generic profile to deploy an existing image without Google ADK settings:
+Use the generic profile to deploy an existing image without Google ADK settings. In a terminal, run
+`shiplord configure` with no options in the repository. It lists your registered servers and asks only for what is
+missing. When the repository has a `Dockerfile` (or `Containerfile`), it suggests `generic` and the port from the
+final stage's `EXPOSE`. You confirm a summary before anything is written. Without a terminal (agents, CI, pipes)
+nothing is asked, and every value comes from options:
 
 ```sh
 shiplord configure --name handwriting --server production \
-  --api-domain handwriting.example.com --no-frontend --template generic
+  --api-domain handwriting.example.com --no-frontend --template generic \
+  --container-port 3000 --health-path /health --memory 512
 ```
 
-This creates `template = "generic"` and `runtime = "docker"`. Edit the generated port, readiness path,
-memory, and storage to match your image before provisioning or deploying. The configure defaults remain
-8080, `/ready`, and 512 MiB; they are examples, not requirements for generic images. The image must start
-its own HTTP service, listen on `0.0.0.0` at `http.container_port`, and return HTTP 200 at `http.readiness_path`.
+This creates `template = "generic"` and `runtime = "docker"`. Without those options the defaults remain 8080,
+`/ready`, and 512 MiB, and the repository is not inspected. Shiplord picks the server-side port and routes the
+hostname to it, so `--container-port` is only the port your application listens on inside its container. The
+image must start its own HTTP service, listen on `0.0.0.0` at `http.container_port` (Shiplord also sets `PORT` to
+that value), and return HTTP 200 at `http.readiness_path`.
 An image can serve both its website and API at the configured hostname.
 
 Both profiles receive `HOST`, `PORT`, and `LOG_LEVEL`. Only `google-adk` receives Shiplord's `AGENT_DIR`,
@@ -207,7 +213,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `server add <alias> --ssh user@host` | Register a trusted SSH login. Never accepts or updates host keys. |
 | `server list` | Show the registered aliases and their SSH targets. Local only; contacts nothing. |
 | `server bootstrap <alias>` | Install or update the helper on the server. Idempotent. |
-| `init`, `configure` | Create a project from the pinned template; create `ship.toml`. |
+| `init`, `configure` | Create a project from the pinned template; create `ship.toml` (asks for missing values in a terminal). |
 | `provision` | Create the application's account, state, port, and key access on the server. |
 | `env set --from-file F` / `env keys` / `env clear` | Manage runtime environment. `set` refuses an empty file; `keys` lists names only. |
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |

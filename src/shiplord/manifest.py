@@ -69,6 +69,19 @@ def validate_hostname(value: object, name: str) -> str:
     return _hostname(value, name)
 
 
+def validate_origin(value: object) -> str:
+    """Validate one frontend origin (scheme, host, optional port; no path or credentials)."""
+    return _origin(value)
+
+
+def validate_readiness_path(value: object) -> str:
+    """Validate the absolute URL path the server polls until the application is ready."""
+    path = _string(value, "http.readiness_path")
+    if not re.fullmatch(r"/[A-Za-z0-9._~/-]*", path) or "//" in path:
+        raise ManifestError("http.readiness_path must be an absolute URL path")
+    return path
+
+
 def _origin(value: object) -> str:
     origin = _string(value, "http.frontend_origins item")
     try:
@@ -130,9 +143,7 @@ def validate_manifest(raw: dict) -> dict:
     if len(set(validated_origins)) != len(validated_origins):
         raise ManifestError("http.frontend_origins must not contain duplicates")
     port = _integer(http.get("container_port"), "http.container_port", 1, 65535)
-    readiness = _string(http.get("readiness_path"), "http.readiness_path")
-    if not re.fullmatch(r"/[A-Za-z0-9._~/-]*", readiness) or "//" in readiness:
-        raise ManifestError("http.readiness_path must be an absolute URL path")
+    readiness = validate_readiness_path(http.get("readiness_path"))
 
     resources = _table(root.get("resources"), "resources", {"memory_mb"})
     memory = _integer(resources.get("memory_mb"), "resources.memory_mb", 1, 1048576)
