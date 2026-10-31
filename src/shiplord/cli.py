@@ -17,7 +17,7 @@ from . import __version__
 from . import commands, github, tailscale
 from .client import AdminClient, ClientError, HelperClient, bootstrap_server
 from .commands import CommandError
-from .configure import ConfigurationError, create_manifest
+from .configure import ConfigurationError, collect_answers, create_manifest
 from .manifest import ManifestError, load_manifest
 from .protocol import IncompatibleProtocol
 from .servers import (InvalidTarget, ServerError, SshOptions, SSHCheckError, list_servers, load_server, register_server,
@@ -218,23 +218,90 @@ def init(name: str, template: str = typer.Option(..., "--template")) -> None:
     typer.echo(f"Created {name} from the pinned google-adk template.")
 
 
+def _interactive() -> bool:
+    """Prompt only when a person is at a terminal; agents, CI, and pipes keep the flag-only behaviour."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _ask(prompt: str, default: str | None) -> str:
+    if default is None:
+        return typer.prompt(prompt)
+    return typer.prompt(prompt, default=default, show_default=bool(default))
+
+
 @app.command()
-def configure(server: str = typer.Option(..., "--server"), api_domain: str = typer.Option(..., "--api-domain"),
+def configure(server: Optional[str] = typer.Option(None, "--server", help="Registered server alias."),
+              api_domain: Optional[str] = typer.Option(None, "--api-domain", help="Public hostname of the application."),
               frontend: Optional[list[str]] = typer.Option(None, "--frontend"),
               no_frontend: bool = typer.Option(False, "--no-frontend"),
               name: Optional[str] = typer.Option(None, "--name"),
-              runtime: str = typer.Option("docker", "--runtime"),
-              template: str = typer.Option("google-adk", "--template")) -> None:
-    """Create ship.toml in the current directory without overwriting it."""
-    if bool(frontend) == no_frontend:
+              runtime: Optional[str] = typer.Option(None, "--runtime", help="docker (default) or native."),
+              template: Optional[str] = typer.Option(None, "--template", help="google-adk (default) or generic."),
+              container_port: Optional[int] = typer.Option(None, "--container-port",
+                                                           help="Port the application listens on in its container."),
+              health_path: Optional[str] = typer.Option(None, "--health-path",
+                                                        help="Path that returns 200 when the application is ready."),
+              memory: Optional[int] = typer.Option(None, "--memory", help="Memory limit in MiB.")) -> None:
+    """Create ship.toml in the current directory without overwriting it. At a terminal, missing values are asked."""
+    if frontend and no_frontend:
         typer.echo("error: specify --frontend or explicitly choose --no-frontend", err=True)
         raise typer.Exit(2)
+    given = {"server": server, "api_domain": api_domain, "name": name, "runtime": runtime, "template": template,
+             "origins": list(frontend) if frontend else ([] if no_frontend else None),
+             "container_port": container_port, "readiness_path": health_path, "memory_mb": memory}
+    directory = Path.cwd()
+    if _interactive():
+        if (directory / "ship.toml").exists() or (directory / "ship.toml").is_symlink():
+            typer.echo("error: ship.toml already exists; no file was replaced", err=True)
+            raise typer.Exit(2)
+        try:
+            servers = list_servers()[0] if server is None else []
+            answers = collect_answers(given, root=directory, servers=servers, ask=_ask, say=typer.echo)
+            typer.echo("\nship.toml will contain:")
+            for label, key in (("name", "name"), ("server", "server"), ("template", "template"), ("runtime", "runtime"),
+                               ("hostname", "api_domain"), ("frontend origins", "origins"),
+                               ("container port", "container_port"), ("health path", "readiness_path"),
+                               ("memory (MiB)", "memory_mb")):
+                value = answers[key]
+                typer.echo(f"  {label}: {', '.join(value) or '(none)' if isinstance(value, list) else value}")
+            if not typer.confirm("Write ship.toml?", default=True):
+                raise typer.Abort()
+        except typer.Abort:
+            typer.echo("Cancelled; no file was created.", err=True)
+            raise typer.Exit(1) from None
+        except ServerError as error:
+            typer.echo(f"error: {error}", err=True)
+            raise typer.Exit(3) from None
+        except ConfigurationError as error:
+            typer.echo(f"error: {error}", err=True)
+            raise typer.Exit(2) from None
+    else:
+        if server is None or api_domain is None:
+            typer.echo("error: --server and --api-domain are required (run `shiplord configure` in a terminal to be "
+                       "asked instead)", err=True)
+            raise typer.Exit(2)
+        if given["origins"] is None:
+            typer.echo("error: specify --frontend or explicitly choose --no-frontend", err=True)
+            raise typer.Exit(2)
+        answers = dict(given, name=name or directory.name, runtime=runtime or "docker",
+                       template=template or "google-adk")
     try:
-        create_manifest(Path.cwd(), name or Path.cwd().name, server, api_domain, frontend or [], runtime, template)
+        create_manifest(directory, answers["name"], answers["server"], answers["api_domain"], answers["origins"],
+                        answers["runtime"], answers["template"],
+                        **{key: answers[key] for key in ("container_port", "readiness_path", "memory_mb")
+                           if answers[key] is not None})
     except (ConfigurationError, ManifestError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from None
-    typer.echo("Created ship.toml. The server alias has not been checked.")
+    try:
+        registered = any(entry["alias"] == answers["server"] for entry in list_servers()[0])
+    except ServerError:
+        registered = False
+    if registered:
+        typer.echo(f"Created ship.toml. Server alias {answers['server']} is registered locally; SSH access was not "
+                   "checked.")
+    else:
+        typer.echo("Created ship.toml. The server alias has not been checked.")
 
 
 @app.command()

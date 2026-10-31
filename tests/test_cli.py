@@ -104,7 +104,11 @@ class CLITests(unittest.TestCase):
         executable = Path(os.environ.get("VIRTUAL_ENV", "")) / "bin" / "shiplord"
         if not executable.is_file():
             executable = Path(__import__("sys").executable).parent / "shiplord"
-        return subprocess.run([str(executable), *args], cwd=directory, text=True, capture_output=True, check=False, env=env)
+        if env is None:  # configure consults the registered servers; never read the developer's own configuration
+            env = dict(os.environ, XDG_CONFIG_HOME=str(Path(directory) / ".test-config"))
+        # stdin is not a terminal, so no command may wait for an answer.
+        return subprocess.run([str(executable), *args], cwd=directory, text=True, capture_output=True, check=False,
+                              env=env, stdin=subprocess.DEVNULL)
 
     def test_plan_uses_local_manifest_and_reports_scope(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -295,6 +299,60 @@ class CLITests(unittest.TestCase):
             result = self.invoke(directory, "configure", "--name", "orders", "--server", "production", "--api-domain", "api.example.com", "--no-frontend")
             self.assertEqual(result.returncode, 2)
             self.assertEqual(target.read_text(), "keep this")
+
+    def test_configure_without_a_terminal_still_requires_server_and_domain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "Dockerfile").write_text("FROM x\nEXPOSE 3000\n")
+            for options in ([], ["--server", "production", "--no-frontend"], ["--api-domain", "api.example.com", "--no-frontend"]):
+                with self.subTest(options=options):
+                    result = self.invoke(directory, "configure", "--name", "orders", *options)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("in a terminal", result.stderr)
+            self.assertFalse((Path(directory) / "ship.toml").exists())
+
+    def test_configure_without_a_terminal_keeps_defaults_and_ignores_the_dockerfile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "Dockerfile").write_text("FROM x\nEXPOSE 3000\n")
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production",
+                                 "--api-domain", "api.example.com", "--no-frontend")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = load_manifest(Path(directory) / "ship.toml")
+            self.assertEqual((config["template"], config["http"]["container_port"], config["http"]["readiness_path"],
+                              config["resources"]["memory_mb"]), ("google-adk", 8080, "/ready", 512))
+
+    def test_configure_writes_port_health_path_and_memory_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.invoke(directory, "configure", "--name", "orders", "--server", "production",
+                                 "--api-domain", "api.example.com", "--no-frontend", "--template", "generic",
+                                 "--container-port", "3000", "--health-path", "/health", "--memory", "256")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = load_manifest(Path(directory) / "ship.toml")
+            self.assertEqual(config["http"]["container_port"], 3000)
+            self.assertEqual(config["http"]["readiness_path"], "/health")
+            self.assertEqual(config["resources"]["memory_mb"], 256)
+            other = Path(directory) / "other"
+            other.mkdir()
+            rejected = self.invoke(str(other), "configure", "--name", "orders", "--server", "production",
+                                   "--api-domain", "api.example.com", "--no-frontend", "--health-path", "health")
+            self.assertEqual(rejected.returncode, 2)
+            self.assertEqual(list(other.iterdir()), [])
+
+    def test_configure_reports_a_locally_registered_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            servers = Path(directory) / ".test-config/shiplord/servers"
+            servers.mkdir(parents=True, mode=0o700)
+            for path in (servers.parent.parent, servers.parent, servers):
+                path.chmod(0o700)
+            (servers / "production.json").write_text(json.dumps({"schema_version": 1, "alias": "production",
+                                                                 "ssh": "admin@example.com"}))
+            (servers / "production.json").chmod(0o600)
+            project = Path(directory) / "orders"
+            project.mkdir()
+            env = dict(os.environ, XDG_CONFIG_HOME=str(Path(directory) / ".test-config"))
+            result = self.invoke(str(project), "configure", "--server", "production", "--api-domain",
+                                 "api.example.com", "--no-frontend", env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("registered locally; SSH access was not checked", result.stdout)
 
     def test_doctor_local_reports_only_local_checks(self):
         with tempfile.TemporaryDirectory() as directory:
