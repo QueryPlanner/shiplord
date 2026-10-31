@@ -165,13 +165,29 @@ What it found:
 - Real Docker: `test_template_change_rollback_and_journal_recovery_restore_the_correct_environment` in
   `tests/test_deploy_integration.py` changes only the profile for one image/commit/sequence. It verifies image
   defaults, persistent files, rollback after a routing failure, recovery after an interrupted transaction,
-  and deliberate rollback. The interruption is simulated in the journal; the containers and environment
-  checks use real Docker.
+  and deliberate rollback with an explicit `8/fail` shutdown policy on both profiles. The interruption is simulated
+  in the journal; the containers and environment checks use real Docker.
 - CLI end to end: `tests/test_e2e.py` provisions a generic application beside an ADK application through
   real SSH, sudo, Caddy, Docker, and the installed helper. It checks distinct environment contracts,
-  storage isolation, and restoration after the generic candidate fails readiness.
+  storage isolation, and restoration after the generic candidate fails readiness. The generic application combines
+  a fresh image-owned `/data` volume with an explicit `8/fail` shutdown policy; all three helper features are
+  negotiated through the CLI, and the primary ADK application's container and counter remain intact.
 - This profile does not implement ownership initialization, rate limits, generic workflow generation, or
   native generic binaries. It does not establish that a particular application is ready for production.
+
+## Graceful Docker replacement (PR 2)
+
+- Unit: `tests/test_shutdown.py` (scripted Docker with a fake clock: exit in time, force, fail, late exit, continuing attempt,
+  ambiguity, malformed metadata, legacy containers, signals, daemon errors, paused, disappearing/unkillable containers,
+  transaction and retirement behavior, budget, negotiation).
+- Real Docker (`tests/linux/run.sh docker`): signal-aware PID 1 flushes a SQLite row and file before the candidate starts;
+  an ignoring process is force-killed after its deadline; with `fail` the original keeps running, recovery refuses while it
+  drains and succeeds after it exits.
+- Unit interruption checks fail the journal write after restart-policy update, signal delivery, and KILL delivery. Recovery
+  resumes from the saved intent, preserves the original deadline, and does not send `KILL` for a `fail` policy.
+- Not done: killing a real worker at every stop phase, the marked real 120-second drain test (short delays used), the
+  real Docker SIGKILL crash gap, shutdown timeout/interruption during rollback or failed-first-deploy cleanup
+  against real Docker, and a seeded-baseline demonstration of the regression.
 
 ## Not verified, and why
 

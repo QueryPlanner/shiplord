@@ -111,7 +111,7 @@ class ReadOnlyActionTests(HelperTestCase):
     def test_capabilities_advertise_every_supported_action_without_touching_the_host(self):
         response, code = self.call("capabilities")
         self.assertEqual((code, response["status"]), (0, "ok"))
-        self.assertEqual(response["actions"], ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover", "docker_storage_v1", "docker_generic_v1"])
+        self.assertEqual(response["actions"], ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"])
         self.assertEqual(self.factory_calls, 0)
 
     def test_malformed_arguments_are_rejected_before_any_host_state_is_opened(self):

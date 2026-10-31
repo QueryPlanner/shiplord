@@ -160,18 +160,20 @@ class NegotiationTests(ClientTestCase):
         self.assertIn("docker_storage_v1", self.client.call("capabilities")["actions"])
         self.assertIn("docker_generic_v1", self.client.call("capabilities")["actions"])
 
-    def test_generic_and_storage_negotiate_once_before_any_plan_or_job(self):
+    def test_combined_features_negotiate_once_before_any_plan_or_job(self):
         manifest = self.storage_manifest() | {"template": "generic"}
+        manifest["deploy"].update(shutdown_timeout_seconds=8, shutdown_timeout_action="fail")
+        supported = ["docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"]
         for operation in (commands.plan_application, commands.deploy_application):
             with self.subTest(operation=operation.__name__):
-                for features in ([], ["docker_storage_v1"], ["docker_generic_v1"]):
+                for features in ([], *(supported[:i] + supported[i + 1:] for i in range(len(supported)))):
                     with patch.object(self.client, "call", return_value={"actions": features}) as call:
                         with self.assertRaises(CommandError) as caught:
                             operation(manifest, self.client, image=IMAGE, commit=COMMIT, sequence=1)
                         self.assertEqual(caught.exception.code, 4)
                         self.assertIn("shiplord server bootstrap", str(caught.exception))
                         self.assertEqual([c.args[0] for c in call.call_args_list], ["capabilities"])
-        with patch.object(self.client, "call", return_value={"actions": ["docker_storage_v1", "docker_generic_v1"]}) as call:
+        with patch.object(self.client, "call", return_value={"actions": supported}) as call:
             commands.require_feature_support(manifest, self.client)
             call.assert_called_once_with("capabilities")
 

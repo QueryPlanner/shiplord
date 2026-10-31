@@ -29,6 +29,7 @@ def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=
 LEGACY_VOLUME = CommandResult(0, "local|null|null|2026-10-30T00:00:00Z|/var/lib/docker/volumes/shiplord-orders-artifacts/_data\n")
 LABELLED_VOLUME = CommandResult(0, 'local|null|{"shiplord.app":"orders"}|2026-10-30T00:00:00Z|'
                                '/var/lib/docker/volumes/shiplord-orders-artifacts/_data\n')
+EXITED_LEGACY = CommandResult(0, "exited unless-stopped |<no value>|<no value>\n")  # a stopped container from before the policy
 REGISTRATION = {"application_id": "orders", "host_port": 20007, "api_domain": "orders.example.com"}
 
 
@@ -59,7 +60,112 @@ class RuntimeTestCase(unittest.TestCase):
         (self.layout.environments / "orders").mkdir(parents=True)
         self.docker = FakeDocker()
         self.docker.results["volume inspect"] = LABELLED_VOLUME
+        self.docker.results["inspect"] = EXITED_LEGACY
         self.runtime = DockerRuntime(self.docker, self.layout, platform_name="linux/amd64")
+
+
+class FakeStopState:
+    def __init__(self, fail_phase=None):
+        self.record = None
+        self.fail_phase = fail_phase
+
+    def read_journal(self):
+        return None if self.record is None else {"stop": dict(self.record)}
+
+    def write_stop(self, record):
+        if record["phase"] == self.fail_phase:
+            self.fail_phase = None
+            raise RuntimeError("simulated worker interruption")
+        self.record = dict(record)
+
+
+class StatefulStopDocker:
+    def __init__(self, *, exit_on_signal=False):
+        self.status = "running"
+        self.restart_policy = "unless-stopped"
+        self.calls = []
+        self.exit_on_signal = exit_on_signal
+        self.exit_on_kill = True
+
+    def run(self, argv, *, input=None, timeout=60, max_output=4096):
+        argv = list(argv)
+        self.calls.append(argv)
+        command = argv[1]
+        if command == "update":
+            self.restart_policy = "no"
+            return CommandResult(0, "")
+        if command == "kill":
+            if argv[2] == "--signal" and argv[3] == "SIGTERM" and self.exit_on_signal:
+                self.status = "exited"
+            if argv[2] == "--signal" and argv[3] == "KILL" and self.exit_on_kill:
+                self.status = "exited"
+            return CommandResult(0, "")
+        if command == "inspect":
+            return CommandResult(0, self.status + "\n")
+        raise AssertionError(f"unexpected command: {argv}")
+
+
+class DurableShutdownTests(RuntimeTestCase):
+    def setUp(self):
+        super().setUp()
+        self.stateful = StatefulStopDocker(exit_on_signal=True)
+        self.clock = [0.0]
+        self.wall = [100.0]
+        self.runtime = DockerRuntime(self.stateful, self.layout, platform_name="linux/amd64",
+                                     clock=lambda: self.clock[0], sleep=lambda _: None,
+                                     wall_clock=lambda: self.wall[0])
+
+    @staticmethod
+    def container(*, action="force", restart_policy="unless-stopped", timeout=2):
+        return {"id": ID_A, "status": "running", "restart_policy": restart_policy, "signal": "SIGTERM",
+                "timeout": timeout, "action": action}
+
+    def test_recovery_reconciles_restart_policy_update_before_signalling(self):
+        state = FakeStopState(fail_phase="restart_disabled")
+        with self.assertRaisesRegex(RuntimeError, "simulated worker interruption"):
+            self.runtime._stop_gracefully(self.container(), state)
+        self.assertEqual(state.record["phase"], "intent")
+        self.assertEqual(self.stateful.restart_policy, "no")
+
+        self.runtime._stop_gracefully(self.container(restart_policy="no"), state)
+        updates = [call for call in self.stateful.calls if call[1] == "update"]
+        signals = [call for call in self.stateful.calls if call[1] == "kill"]
+        self.assertEqual(len(updates), 1)
+        self.assertEqual([call[3] for call in signals], ["SIGTERM"])
+        self.assertEqual(state.record["phase"], "signalled")
+
+    def test_recovery_retries_uncertain_signal_and_fail_policy_never_kills(self):
+        self.stateful.exit_on_signal = False
+        state = FakeStopState(fail_phase="signalled")
+        with self.assertRaisesRegex(RuntimeError, "simulated worker interruption"):
+            self.runtime._stop_gracefully(self.container(action="fail"), state)
+        self.assertEqual(state.record["phase"], "signal_pending")
+
+        self.wall[0] = 102.0  # the persisted deadline expired while the worker was down
+        with self.assertRaises(RuntimeFailure) as caught:
+            self.runtime._stop_gracefully(self.container(action="fail", restart_policy="no"), state)
+        self.assertEqual(caught.exception.kind, "shutdown_timeout")
+        signals = [call[3] for call in self.stateful.calls if call[1] == "kill"]
+        self.assertEqual(signals, ["SIGTERM", "SIGTERM"])
+        self.assertEqual(state.record["phase"], "signalled")
+
+    def test_recovery_retries_kill_when_the_worker_stops_before_recording_it(self):
+        self.stateful.exit_on_signal = False
+        self.stateful.exit_on_kill = False
+        self.wall[0] = 102.0
+        record = {"container_id": ID_A, "restart_policy": "unless-stopped", "timeout_seconds": 2,
+                  "action": "force", "signal": "SIGTERM", "deadline_epoch": 102, "phase": "kill_pending"}
+        state = FakeStopState(fail_phase="killed")
+        state.record = dict(record)
+        with self.assertRaisesRegex(RuntimeError, "simulated worker interruption"):
+            self.runtime._stop_gracefully(self.container(restart_policy="no"), state)
+        self.assertEqual(state.record["phase"], "kill_pending")
+
+        self.stateful.exit_on_kill = True
+        self.runtime._stop_gracefully(self.container(restart_policy="no"), state)
+        kills = [call for call in self.stateful.calls if call[1] == "kill" and call[3] == "KILL"]
+        self.assertEqual(len(kills), 2)
+        self.assertEqual(state.record["phase"], "killed")
 
 
 class IdentityTests(unittest.TestCase):
@@ -151,7 +257,7 @@ class StartTests(RuntimeTestCase):
         argv = self.start(origins=["https://orders.example.com"])
         names = [c[1] for c in self.docker.calls]
         self.assertLess(names.index("rm"), names.index("run"))
-        self.assertEqual(self.docker.sub("rm")[0], ["/usr/bin/docker", "rm", "--force", ID_A, ID_B])
+        self.assertEqual(self.docker.sub("rm"), [["/usr/bin/docker", "rm", ID_A], ["/usr/bin/docker", "rm", ID_B]])  # never --force
         self.assertEqual(self.docker.sub("ps")[0][-1], "label=shiplord.app=orders")
         self.assertEqual(argv[-1], "ghcr.io/example/orders@sha256:" + "b" * 64)
         pairs = {argv[i]: argv[i + 1] for i in range(len(argv) - 1) if argv[i].startswith("--")}
@@ -200,7 +306,8 @@ class StartTests(RuntimeTestCase):
                                    ("run", CommandResult(125, "bad flag"), "start")):
             with self.subTest(key):
                 self.docker.calls.clear()
-                self.docker.results = {"volume inspect": LABELLED_VOLUME, "ps": CommandResult(0, ID_A + "\n"), key: result}
+                self.docker.results = {"volume inspect": LABELLED_VOLUME, "inspect": EXITED_LEGACY,
+                                       "ps": CommandResult(0, ID_A + "\n"), key: result}
                 with self.assertRaises(RuntimeFailure) as caught:
                     self.runtime.start(REGISTRATION, release())
                 self.assertEqual(caught.exception.phase, phase)
@@ -214,7 +321,7 @@ class StartTests(RuntimeTestCase):
     def test_stop_removes_only_labelled_containers(self):
         self.docker.results["ps"] = CommandResult(0, ID_A + "\n")
         self.runtime.stop(REGISTRATION)
-        self.assertEqual(self.docker.sub("rm")[0], ["/usr/bin/docker", "rm", "--force", ID_A])
+        self.assertEqual(self.docker.sub("rm")[0], ["/usr/bin/docker", "rm", ID_A])
         self.docker.calls.clear()
         self.docker.results["ps"] = CommandResult(0, "")
         self.runtime.stop(REGISTRATION)
@@ -223,8 +330,9 @@ class StartTests(RuntimeTestCase):
 
 class InspectTests(RuntimeTestCase):
     def inspect_output(self, state="true false", image="b", mounts=("volume:shiplord-orders-artifacts:/app/src/.adk",),
-                       template="google-adk"):
-        return CommandResult(0, f"{state} ghcr.io/example/orders@sha256:{image * 64} {' '.join(mounts)}|{template}\n")
+                       timeout="<no value>", action="<no value>", template="google-adk"):
+        return CommandResult(0, f"{state} ghcr.io/example/orders@sha256:{image * 64}|{timeout}|{action}|{template}|"
+                                f" {' '.join(mounts)}\n")
 
     def test_profile_changes_require_a_new_container_even_with_the_same_image_and_identity(self):
         for actual in ("generic", "google-adk", "", "<no value>", "unknown", "google-adk|generic"):
@@ -265,13 +373,29 @@ class InspectTests(RuntimeTestCase):
 
     def test_a_registry_alias_does_not_change_the_identity_but_a_digest_does(self):
         mirrored = CommandResult(0, "true false localhost:5000/example/orders@sha256:" + "b" * 64
-                                 + " volume:shiplord-orders-artifacts:/app/src/.adk|google-adk\n")
+                                 + "|<no value>|<no value>|google-adk| volume:shiplord-orders-artifacts:/app/src/.adk\n")
         self.docker.results["inspect"] = mirrored
         self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
         self.docker.results["inspect"] = CommandResult(0, mirrored.output.replace("b" * 64, "c" * 64))
         self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
-        self.docker.results["inspect"] = CommandResult(0, "true false orders:latest volume:shiplord-orders-artifacts:/app/src/.adk\n")
+        self.docker.results["inspect"] = CommandResult(0, "true false orders:latest|<no value>|<no value>|google-adk|"
+                                                         "volume:shiplord-orders-artifacts:/app/src/.adk\n")
         self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
+
+    def test_shutdown_policy_is_part_of_running_identity(self):
+        candidate = release()
+        candidate["configuration"]["deploy"].update(shutdown_timeout_seconds=120, shutdown_timeout_action="fail")
+        self.docker.results["inspect"] = self.inspect_output(timeout="1", action="force")
+        self.assertFalse(self.runtime.is_running(REGISTRATION, candidate))
+        self.docker.results["inspect"] = self.inspect_output(timeout="120", action="fail")
+        self.assertTrue(self.runtime.is_running(REGISTRATION, candidate))
+        self.docker.results["inspect"] = self.inspect_output(timeout="120", action="bad")
+        self.assertFalse(self.runtime.is_running(REGISTRATION, candidate))
+
+    def test_an_image_declared_mount_does_not_change_release_identity(self):
+        self.docker.results["inspect"] = self.inspect_output(
+            mounts=("volume:shiplord-orders-artifacts:/app/src/.adk", "volume:anonymous:/scratch"))
+        self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
 
     def test_a_configured_path_is_the_one_verified_and_a_legacy_container_matches_the_default(self):
         configured = release(storage={"container_path": "/data"})

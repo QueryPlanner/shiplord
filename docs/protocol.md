@@ -55,6 +55,10 @@ the shared `HOST`, `PORT`, and `LOG_LEVEL` environment, and checks the container
 when reconciling a release. Missing labels retain the legacy `google-adk` meaning. The client checks all
 requested optional features in one capabilities call before submitting `plan` or `deploy`.
 
+`docker_shutdown_v1` means the helper honours `deploy.shutdown_timeout_seconds` / `shutdown_timeout_action`. `plan` adds
+`shutdown: {outgoing_policy, candidate_policy, note}`, and a finished deploy may include `shutdown` stage reports
+(`stop_requested`, `signalled`, `waiting`, `exited`, `forced`, `deadline_expired`).
+
 Arguments are validated before any host state is opened. `artifact` is `{"kind": "docker", "image":
 "registry/name@sha256:<64 hex>"}` (the repository must equal the registered one) or `{"kind": "native", "sha256",
 "size", "architecture"}`. `configuration` is a complete `ship.toml` as JSON; its hostname must equal the registered

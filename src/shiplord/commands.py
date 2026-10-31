@@ -18,6 +18,7 @@ from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
 from .manifest import GENERIC_DOCKER_FEATURE
 from .runtime import RuntimeFailure
+from .shutdown import FEATURE as SHUTDOWN_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
 from .protocol import PROTOCOL_VERSION
 
@@ -223,11 +224,17 @@ def validate_deploy_inputs(manifest: dict, artifact: str | Path, commit: str) ->
     return resolved
 
 
+def uses_shutdown_policy(manifest: dict) -> bool:
+    return any(key in manifest["deploy"] for key in ("shutdown_timeout_seconds", "shutdown_timeout_action"))
+
+
 def require_feature_support(manifest: dict, client: HelperClient) -> None:
     """Refuse settings an older helper would ignore, before submitting a plan or a job."""
     required = {}
     if "storage" in manifest:
         required[STORAGE_FEATURE] = "[storage]"
+    if uses_shutdown_policy(manifest):
+        required[SHUTDOWN_FEATURE] = "shutdown_timeout_*"
     if manifest["template"] == "generic":
         required[GENERIC_DOCKER_FEATURE] = "template = generic"
     if not required:
@@ -237,6 +244,14 @@ def require_feature_support(manifest: dict, client: HelperClient) -> None:
     if missing:
         raise CommandError("the server helper does not support " + ", ".join(missing) +
                            "; re-run `shiplord server bootstrap` to upgrade it, then retry", 4)
+
+
+def job_timeout(manifest: dict) -> float:
+    """Wait through the server's full Docker job bound, since stored releases are not in the local manifest."""
+    if manifest["runtime"] == "docker":
+        from .shutdown import MAX_JOB_SECONDS
+        return MAX_JOB_SECONDS + 30  # leave time to read the job result after the worker's hard limit
+    return manifest["deploy"]["readiness_timeout_seconds"] + 900
 
 
 def deploy_application(manifest: dict, client: HelperClient, *, image: str | None = None, binary: Path | None = None,
@@ -249,7 +264,7 @@ def deploy_application(manifest: dict, client: HelperClient, *, image: str | Non
     arguments = _deploy_arguments(manifest, artifact, sequence, allow_older)
     require_feature_support(manifest, client)
     request_id = request_id or new_request_id("deploy")
-    timeout = timeout or manifest["deploy"]["readiness_timeout_seconds"] + 900
+    timeout = timeout or job_timeout(manifest)
     outcome = submit_and_wait(client, "deploy", request_id=request_id, commit=commit, arguments=arguments,
                               timeout=timeout, on_progress=on_progress, payload=binary)
     result = {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
@@ -290,7 +305,7 @@ def application_logs(client: HelperClient, tail: int) -> tuple[int, dict]:
 def run_job_command(manifest: dict, client: HelperClient, action: str, *, request_id: str | None = None,
                     on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
     request_id = request_id or new_request_id(action)
-    outcome = submit_and_wait(client, action, request_id=request_id, timeout=manifest["deploy"]["readiness_timeout_seconds"] + 900,
+    outcome = submit_and_wait(client, action, request_id=request_id, timeout=job_timeout(manifest),
                               on_progress=on_progress)
     return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
                                   "exit_code": outcome["exit_code"], **outcome["detail"]}

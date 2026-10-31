@@ -440,12 +440,18 @@ else: sys.exit("unsupported: " + " ".join(args))
         self.cli("configure", "--name", second, "--server", "production", "--api-domain", "second.example.test",
                  "--no-frontend", "--template", "generic", check=0, cwd=project)
         manifest = project / "ship.toml"
-        manifest.write_text(manifest.read_text() + '\n[github]\nrepository = "shiplord/fixture"\ndeployment_branch = "main"\n')
+        manifest.write_text(manifest.read_text().replace(
+            "[deploy]\n", '[deploy]\nshutdown_timeout_seconds = 8\nshutdown_timeout_action = "fail"\n')
+            + '\n[storage]\ncontainer_path = "/data"\n'
+            + '\n[github]\nrepository = "shiplord/fixture"\ndeployment_branch = "main"\n')
         first_containers = self.containers_of(self.app)
         provisioned = json.loads(self.cli("provision", "--public-key", str(ROOT / "dev_key.pub"), "--json", check=0, cwd=project).stdout)
         self.assertNotEqual(provisioned["host_port"], self.port)
         self.assertEqual(provisioned["deployment_user"], f"ship-{second}")
         type(self).port2 = provisioned["host_port"]
+        environment_file = project / "runtime.env"
+        environment_file.write_text("DATA_DIR=/data\n")
+        self.cli("env", "set", "--from-file", str(environment_file), "--json", check=0, cwd=project)
         image = self.images["v1"]
         result = json.loads(self.cli("deploy", "--image", image["image"], "--commit", image["commit"], "--sequence", "100",
                                      "--no-verify-public", "--json", check=0, cwd=project).stdout)
@@ -453,18 +459,29 @@ else: sys.exit("unsupported: " + " ".join(args))
         generic_environment = json.loads(self.get_from(self.port2, "/env"))
         self.assertEqual(generic_environment["AGENT_NAME"], "image-default")
         self.assertIsNone(generic_environment["SERVE_WEB_INTERFACE"])
+        self.assertEqual(generic_environment["DATA_DIR"], "/data")
+        (container,) = self.containers_of(second)
+        inspected = json.loads(fixtures.docker("inspect", container).stdout)[0]
+        labels = inspected["Config"]["Labels"]
+        self.assertEqual((labels["shiplord.template"], labels["shiplord.shutdown_timeout"],
+                          labels["shiplord.shutdown_action"]), ("generic", "8", "fail"))
+        self.assertEqual([(m["Type"], m["Name"], m["Destination"]) for m in inspected["Mounts"]],
+                         [("volume", f"shiplord-{second}-artifacts", "/data")])
         self.assertEqual(json.loads(self.get("/env"))["AGENT_NAME"], self.app)
         self.assertEqual((self.get_from(self.port2, "/version"), self.get_from(self.port, "/version")), ("v1", "v2"))
         self.assertEqual(self.containers_of(self.app), first_containers)  # the first application was not touched
         self.assertEqual(self.get_from(self.port2, "/counter"), "1")  # its own volume, not the first one's counter
-        self.assertNotEqual(self.get("/counter"), "1")
+        first_counter = int(self.get("/counter"))
+        self.assertGreater(first_counter, 1)
         bad = self.images["v3"]
         failed = self.cli("deploy", "--image", bad["image"], "--commit", bad["commit"], "--sequence", "101", "--no-verify-public",
                           "--json", check=5, cwd=project)
         self.assertEqual(json.loads(failed.stdout)["status"], "rolled_back")
         self.assertEqual(json.loads(self.get_from(self.port2, "/env"))["AGENT_NAME"], "image-default")
+        self.assertEqual(self.get_from(self.port2, "/counter"), "2")
         self.assertEqual(self.containers_of(self.app), first_containers)
         self.assertEqual(self.get("/version"), "v2")
+        self.assertEqual(self.get("/counter"), str(first_counter + 1))
 
     def test_24_each_applications_login_is_refused_for_the_other_and_both_routes_are_live(self):
         def as_login(login_app, cwd):
