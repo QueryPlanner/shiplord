@@ -38,11 +38,26 @@ ENABLED = os.environ.get("SHIPLORD_TEST_DOCKER") == "1" and shutil.which("docker
 REGISTRY_PORT = 5000
 REPOSITORY = f"localhost:{REGISTRY_PORT}/shiplord/fixture"
 SERVER = '''
-import http.server, json, os, sys
+import http.server, json, os, signal, sys, time
 
 if os.environ.get("MODE") == "crash":
     print("fixture crashing on purpose", flush=True)
     sys.exit(1)
+def drain(*_):  # a well-behaved PID 1: finish the task in flight, flush a row and a file, then exit
+    time.sleep(1)
+    import sqlite3
+    database = sqlite3.connect(os.path.join(DATA, "app.db"))
+    database.execute("CREATE TABLE IF NOT EXISTS rows (id INTEGER PRIMARY KEY, version TEXT)")
+    database.execute("INSERT INTO rows (version) VALUES ('drained')")
+    database.commit()
+    with open(os.path.join(DATA, "drained"), "w") as file:
+        file.write("done")
+    os._exit(0)
+
+if os.environ.get("MODE") == "graceful":
+    signal.signal(signal.SIGTERM, drain)
+elif os.environ.get("MODE") == "ignore":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 DATA = os.environ.get("DATA_DIR", "/app/src/.adk")  # the legacy path unless a test points the app elsewhere
 ARTIFACTS = DATA
 
@@ -58,6 +73,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/env":
             keys = ("ALLOW_ORIGINS", "SERVE_WEB_INTERFACE", "RELOAD_AGENTS", "AGENT_NAME", "HOST", "PORT", "AGENT_DIR", "CUSTOM_TOKEN")
             body = json.dumps({k: os.environ.get(k) for k in keys}).encode()
+        elif self.path == "/drained":
+            path = os.path.join(DATA, "drained")
+            body = open(path).read().encode() if os.path.exists(path) else b"missing"
         elif self.path == "/sqlite":
             import sqlite3
             database = sqlite3.connect(os.path.join(DATA, "app.db"))
@@ -142,7 +160,8 @@ class RealDockerDeployTests(unittest.TestCase):
         images = {}
         for version, mode, commit in (("v1", "healthy", "a"), ("v2", "healthy", "b"), ("v3", "unhealthy", "c"),
                                       ("v4", "crash", "d"), ("v5", "healthy", "e"),
-                                      ("v6-volume", "healthy", "f")):
+                                      ("v6", "graceful", "f"), ("v7", "ignore", "7"), ("v8", "healthy", "8"),
+                                      ("v6-volume", "healthy", "9")):
             tag = f"{REPOSITORY}:{version}"
             dockerfile = context / "Dockerfile"
             if version == "v6-volume":
@@ -393,6 +412,66 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertEqual(json.loads(self.get("/sqlite")), ["v1", "v1", "v1"])
         self.assertNotIn("storage", self.state.read_state()["current"]["configuration"])
 
+    def policy_configuration(self, timeout, action):
+        value = self.configuration()
+        value["deploy"].update(shutdown_timeout_seconds=timeout, shutdown_timeout_action=action)
+        return value
+
+    def fresh_container_slate(self):
+        """Shutdown tests deliberately leave stubborn containers behind; each starts with none (the outgoing policy governs)."""
+        if self.containers():
+            docker("rm", "-f", *self.containers())
+
+    def test_zz_graceful_replacement_with_a_signal_aware_process(self):
+        self.fresh_container_slate()
+        self.set_data_dir("/app/src/.adk")
+        policy = self.policy_configuration(8, "fail")
+        self.assertOutcome(self.deploy("req-g1", "v6", 8200, configuration=policy), "succeeded")
+        self.assertEqual(self.get("/version"), "v6")
+        replaced = self.deploy("req-g2", "v8", 8201, configuration=policy)
+        self.assertOutcome(replaced, "succeeded")
+        (report,) = replaced.detail["shutdown"]
+        self.assertFalse(report["forced"])
+        self.assertEqual(report["stages"][:2], ["stop_requested", "signalled"])
+        self.assertEqual(self.get("/drained"), "done")  # flushed before the candidate started
+        self.assertIn("drained", json.loads(self.get("/sqlite")))
+        self.assertEqual(len(self.containers()), 1)
+        labels = self.inspect()["Config"]["Labels"]
+        self.assertEqual((labels["shiplord.shutdown_timeout"], labels["shiplord.shutdown_action"]), ("8", "fail"))
+
+    def test_zz_force_kills_a_process_that_ignores_the_signal(self):
+        self.fresh_container_slate()
+        policy = self.policy_configuration(2, "force")
+        self.assertOutcome(self.deploy("req-f1", "v7", 8100, configuration=policy), "succeeded")
+        started = time.monotonic()
+        replaced = self.deploy("req-f2", "v8", 8101, configuration=policy)
+        self.assertOutcome(replaced, "succeeded")
+        self.assertTrue(replaced.detail["shutdown"][0]["forced"])
+        self.assertGreaterEqual(time.monotonic() - started, 2)
+        self.assertEqual(self.get("/version"), "v8")
+
+    def test_zz_fail_keeps_the_original_and_recovery_waits_for_its_exit(self):
+        self.fresh_container_slate()
+        policy = self.policy_configuration(2, "fail")
+        self.assertOutcome(self.deploy("req-x1", "v7", 8000, configuration=policy), "succeeded")
+        (original,) = self.containers()
+        blocked = self.deploy("req-x2", "v8", 8001, configuration=policy)
+        self.assertOutcome(blocked, "intervention_required")
+        self.assertEqual((blocked.exit_code, blocked.detail["kind"]), (6, "shutdown_timeout"))
+        self.assertEqual(self.containers(), [original])  # not killed, not removed, no candidate
+        self.assertEqual(docker("inspect", "--format", "{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}", original).stdout.strip(),
+                         "true no")
+        self.assertIsNotNone(self.state.read_journal())
+        with self.lock.acquire():
+            self.assertOutcome(self.deployer.recover(), "intervention_required")  # still draining: nothing is cleared
+        self.assertEqual(self.containers(), [original])
+        self.assertEqual(docker("inspect", "--format", "{{.State.Running}}", original).stdout.strip(), "true")
+        docker("kill", "--signal", "KILL", original)  # the process finally exits
+        with self.lock.acquire():
+            self.assertOutcome(self.deployer.recover(), "recovered")
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(self.get("/version"), "v7")
+        self.assertEqual(len(self.containers()), 1)
     def test_z_image_declared_volume_does_not_break_readiness_or_release_identity(self):
         deployed = self.deploy("req-v6", "v6-volume", 5002)
         self.assertOutcome(deployed, "succeeded")

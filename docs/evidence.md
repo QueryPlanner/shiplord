@@ -149,6 +149,20 @@ What it found:
   proven writable by UID 10001 in the real-Docker suite. The helper continues to reject `owner_uid`/`owner_gid` until
   both prerequisites pass.
 
+## Graceful Docker replacement (PR 2)
+
+- Unit: `tests/test_shutdown.py` (scripted Docker with a fake clock: exit in time, force, fail, late exit, continuing attempt,
+  ambiguity, malformed metadata, legacy containers, signals, daemon errors, paused, disappearing/unkillable containers,
+  transaction and retirement behavior, budget, negotiation).
+- Real Docker (`tests/linux/run.sh docker`): signal-aware PID 1 flushes a SQLite row and file before the candidate starts;
+  an ignoring process is force-killed after its deadline; with `fail` the original keeps running, recovery refuses while it
+  drains and succeeds after it exits.
+- Unit interruption checks fail the journal write after restart-policy update, signal delivery, and KILL delivery. Recovery
+  resumes from the saved intent, preserves the original deadline, and does not send `KILL` for a `fail` policy.
+- Not done: killing a real worker at every stop phase, the marked real 120-second drain test (short delays used), the
+  real Docker SIGKILL crash gap, rollback/failed-first-deploy cleanup against real Docker, and a seeded-baseline
+  demonstration of the regression.
+
 ## Not verified, and why
 
 - The plan's controlled installation procedure (§12E) on your production server; the real server run above used a separate VM.
