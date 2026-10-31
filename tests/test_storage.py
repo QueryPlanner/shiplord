@@ -168,7 +168,7 @@ class NegotiationTests(ClientTestCase):
 
     def test_legacy_manifests_never_probe_capabilities(self):
         with patch.object(self.client, "call", side_effect=AssertionError("unexpected call")):
-            commands.require_storage_support(validate_manifest(configuration()), self.client)
+            commands.require_feature_support(validate_manifest(configuration()), self.client)
 
     def test_a_plan_through_the_real_helper_shows_the_path_and_creates_no_job(self):
         code, plan = commands.plan_application(self.storage_manifest(), self.client, image=IMAGE, commit=COMMIT, sequence=1000)

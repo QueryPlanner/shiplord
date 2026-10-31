@@ -18,6 +18,7 @@ from .registry import validate_registration
 from .release_state import ReleaseState, StateError, validate_release
 from .routing import RouteManager, RoutingError
 from .runtime import Runtime, RuntimeFailure, release_id
+from .shutdown import ShutdownError, check_budget, check_recovery_budget, policy
 from .storage import container_path
 
 MAX_FUTURE_SECONDS = 24 * 3600  # clock skew allowance; a far-future sequence would otherwise freeze the application
@@ -116,6 +117,10 @@ class Deployer:
         except StateError as error:
             return Outcome("rejected", 2, {"error": "invalid_request", "message": str(error)})
         current = committed["current"]
+        try:
+            self._validate_budget(candidate, current)
+        except StateError as error:
+            return Outcome("rejected", 2, {"error": "invalid_request", "message": str(error)})
         stale = self._stale(request, candidate, current)
         if stale is not None:
             self._abandon(candidate, committed)  # whatever an upload left behind
@@ -132,7 +137,11 @@ class Deployer:
             candidate = self._candidate(request)
             refusal = self._gate(request.get("request_id"))
             # A release that would be refused anyway is refused before any upload is accepted or stored.
-            return refusal or self._stale(request, candidate, self.state.read_state()["current"])
+            if refusal:
+                return refusal
+            current = self.state.read_state()["current"]
+            self._validate_budget(candidate, current)
+            return self._stale(request, candidate, current)
         except StateError as error:
             return Outcome("rejected", 2, {"error": "invalid_request", "message": str(error)})
 
@@ -157,7 +166,14 @@ class Deployer:
             storage = {"storage": {"current_path": old, "candidate_path": new, "same_volume": True,
                                    "note": "the application's single volume is mounted at the candidate path; no files are moved "
                                            "and no data is migrated" if old not in (None, new) else "no path change"}}
-        return {"action": "deploy", "restarts_application": current is not None, **storage,
+        shutdown = {}
+        if candidate["artifact"]["kind"] == "docker":
+            outgoing = policy(current["configuration"]) if current else None
+            shutdown = {"shutdown": {"outgoing_policy": None if outgoing is None else {"timeout_seconds": outgoing[0], "action": outgoing[1]},
+                                     "candidate_policy": dict(zip(("timeout_seconds", "action"), policy(candidate["configuration"]))),
+                                     "note": "the outgoing container's own policy governs its stop; the candidate's applies "
+                                             "when it is later replaced"}}
+        return {"action": "deploy", "restarts_application": current is not None, **storage, **shutdown,
                 "route_change": {"absent": "create", "different": "replace", "identical": "none"}[route], **base}
 
     def rollback(self, request_id: str) -> Outcome:
@@ -177,8 +193,12 @@ class Deployer:
             if self.state.read_journal() is None:
                 return Outcome("nothing_to_recover", 0, {"current": identity(self.state.read_state()["current"])})
             target = self.state.reconciliation_target()
+            journal = self.state.read_journal()
+            check_recovery_budget(journal["candidate"], target)
         except StateError as error:
             return Outcome("intervention_required", 6, {"error": "state_inconsistent", "message": str(error)})
+        except ShutdownError as error:
+            return Outcome("intervention_required", 6, {"error": "recovery_budget_exceeded", "message": str(error)})
         try:
             candidate = self.state.read_journal()["candidate"]
             self._reconcile(target, route=True)
@@ -203,6 +223,10 @@ class Deployer:
 
     # the transaction ---------------------------------------------------------
     def _transition(self, request_id: str, candidate: dict, before: dict) -> Outcome:
+        try:
+            self._validate_budget(candidate, before["current"])
+        except StateError as error:
+            return Outcome("rejected", 2, {"error": "invalid_request", "message": str(error)})
         self.progress("prepare", {})
         try:
             prepared = self.runtime.prepare(self.registration, candidate)
@@ -217,7 +241,7 @@ class Deployer:
         probes: dict = {}
         try:
             self._advance("runtime-changing")
-            self._start_runtime(candidate, storage_provenance)
+            self._start_runtime(candidate, storage_provenance, state=self.state)
             probes["local_ready"] = self.probes.wait_ready(
                 self.registration, candidate, alive=lambda: self.runtime.is_running(self.registration, candidate))
             self._advance("runtime-ready")
@@ -233,6 +257,9 @@ class Deployer:
                                    "routing")
             self._advance("routing-ready")
         except (RuntimeFailure, ProbeFailure, RoutingError, _StepFailure, StateError) as failure:
+            if isinstance(failure, RuntimeFailure) and failure.intervention_required:
+                # The outgoing process was signalled and may still be draining: restoring would restart or remove it.
+                return self._intervention(failure, probes)
             return self._restore(failure, probes, candidate, before)
         try:
             self.state.record_commit()
@@ -244,13 +271,42 @@ class Deployer:
         probes["dns"] = self.probes.dns(self.registration)
         warnings = self._retire(before, candidate)
         return Outcome("succeeded", 0, {"release": identity(candidate), "previous": identity(before["current"]),
-                                        "image": prepared, "probes": probes, "warnings": warnings})
+                                        "image": prepared, "probes": probes, "warnings": warnings, **self._shutdown_report()})
+
+    def _validate_budget(self, candidate: dict, outgoing: dict | None) -> None:
+        if candidate["artifact"]["kind"] != "docker":
+            return
+        explicit = any(key in candidate["configuration"]["deploy"]
+                       for key in ("shutdown_timeout_seconds", "shutdown_timeout_action"))
+        if outgoing is not None:
+            explicit = explicit or any(key in outgoing["configuration"]["deploy"]
+                                       for key in ("shutdown_timeout_seconds", "shutdown_timeout_action"))
+        if not explicit:
+            return  # preserve the existing bounds for releases that predate shutdown policies
+        try:
+            check_budget(candidate["configuration"], outgoing["configuration"] if outgoing else None)
+        except ShutdownError as error:
+            raise StateError(str(error)) from None
+
+    def _shutdown_report(self) -> dict:
+        report = getattr(self.runtime, "stop_report", None)
+        return {"shutdown": list(report)} if report else {}
+
+    def _intervention(self, failure: Exception, probes: dict) -> Outcome:
+        """Retain the journal: the stop attempt cannot be retracted, so only a verified recovery may end it."""
+        return Outcome("intervention_required", 6, {"error": "intervention_required", **self._describe(failure),
+                                                     "probes": probes, **self._shutdown_report(),
+                                                     "recovery": "run `shiplord recover` once the application has exited"})
 
     def _advance(self, phase: str) -> None:
         self.progress(phase, {})
         self.state.advance(phase)
 
-    def _start_runtime(self, release: dict, storage_provenance: dict | None = None) -> None:
+    def _start_runtime(self, release: dict, storage_provenance: dict | None = None, *, state=None) -> None:
+        start_with_state = getattr(self.runtime, "start_with_state", None)
+        if start_with_state is not None:
+            start_with_state(self.registration, release, state or self.state, storage_provenance)
+            return
         if storage_provenance is not None:
             start_with_provenance = getattr(self.runtime, "start_with_provenance", None)
             if start_with_provenance is not None:
@@ -274,12 +330,24 @@ class Deployer:
         journal = self.state.read_journal()
         storage_provenance = None if journal is None else journal.get("storage_provenance")
         if target is None:
-            self.runtime.stop(self.registration)
+            stop_with_state = getattr(self.runtime, "stop_with_state", None)
+            if stop_with_state is not None:
+                stop_with_state(self.registration, self.state)
+            else:
+                self.runtime.stop(self.registration)
             if route:
                 self.routes.reconcile(self.app, None)
             return
-        if not (self.runtime.is_running(self.registration, target) and self.probes.ready_once(self.registration, target)):
-            self._start_runtime(target, storage_provenance)
+        if (journal is None or journal.get("stop") is None) and getattr(
+                self.runtime, "stop_in_progress", lambda registration: False)(self.registration):
+            # A signalled process is still draining. Declaring the journal reconciled (or recreating the container) would
+            # hide or repeat a legacy stop attempt that predates durable stop intent.
+            raise RuntimeFailure("a shutdown is still in progress for the application", "stop", intervention_required=True,
+                                 kind="shutdown_in_progress")
+        stop_pending = journal is not None and journal.get("stop") is not None
+        if stop_pending or not (self.runtime.is_running(self.registration, target)
+                                and self.probes.ready_once(self.registration, target)):
+            self._start_runtime(target, storage_provenance, state=self.state)
             self.probes.wait_ready(self.registration, target,
                                    alive=lambda: self.runtime.is_running(self.registration, target))
         if route:

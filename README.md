@@ -110,6 +110,31 @@ slashes), and may not be, or be inside, `/proc`, `/sys`, `/dev`, `/run`, `/etc`,
 - `owner_uid` / `owner_gid` are validated but **not yet supported**: the helper rejects them, because establishing
   ownership safely needs a pinned initializer image that has not been built and reviewed.
 
+## Graceful replacement (Docker)
+
+Replacing a Docker release now signals the old container, waits, and only then removes it and starts the new one:
+
+```toml
+[deploy]
+shutdown_timeout_seconds = 120   # 1-300; default 10
+shutdown_timeout_action = "fail" # "force" (default) or "fail"
+```
+
+- The container's stop signal (image `STOPSIGNAL`, default SIGTERM) is sent after its restart policy is turned off.
+  Recovery may resend it if a worker stops before recording that Docker accepted it. SIGKILL/SIGSTOP are refused as
+  graceful signals.
+- At the deadline, `force` sends an explicit SIGKILL and reports `forced: true`; `fail` kills and removes nothing, starts no
+  candidate, keeps the journal and exits 6 (`intervention_required`). Run `shiplord recover` once the process has exited;
+  recovery will not clear the journal while it is still draining. Daemon or inspection errors never trigger force.
+- The **outgoing** container's recorded policy governs its stop (containers carry it as labels; older containers are 10 s /
+  `force`). `shiplord plan` shows both. Neither policy guarantees an application's jobs complete.
+- Two live containers for one application are refused before anything is signalled.
+- Retirement removes the route first; if the stop then fails, the route stays gone, registration and data are kept.
+- An explicit policy is refused if its worst-case time (lock wait, pull, both stops, both readiness waits) exceeds the
+  3600 s job limit. Needs helper capability `docker_shutdown_v1`; do not downgrade a helper after using it.
+- The shutdown journal persists the original deadline. Recovery uses the time remaining rather than starting a new
+  timeout period.
+
 ## Deploying from GitHub Actions
 
 ```sh

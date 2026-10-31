@@ -27,6 +27,9 @@ def make_retirer(layout: Layout, system: System, lock: HostLock, caddy: CaddyCom
             RouteManager(layout.caddy_root, lock, caddy).remove(registration["application_id"])
             runtime.stop(registration)
         except (RoutingError, RuntimeFailure) as failure:
+            if isinstance(failure, RuntimeFailure) and failure.intervention_required:
+                raise ProvisionError(f"could not retire the application: {failure}. Its public route was already removed "
+                                     "and its registration and data are kept; once it has exited, retry the retirement") from None
             raise ProvisionError(f"could not retire the application: {failure}") from None
         for release in (state["current"], state["previous"]):
             if release is not None:
