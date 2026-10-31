@@ -145,9 +145,33 @@ What it found:
   baseline in real Docker (the unit test shows it at the `is_running` boundary). A legacy unlabelled volume is accepted
   only when a retained Shiplord container proves the exact volume; that proof is tied to the inspected volume identity
   in the transaction journal.
-- **Handwriting Studio adoption remains blocked** until a pinned initializer image is reviewed and a fresh volume is
-  proven writable by UID 10001 in the real-Docker suite. The helper continues to reject `owner_uid`/`owner_gid` until
-  both prerequisites pass.
+- **Explicit ownership initialization remains blocked** until a pinned initializer image is reviewed and a fresh
+  volume is proven writable by UID 10001 in the real-Docker suite. The helper continues to reject
+  `owner_uid`/`owner_gid` until both prerequisites pass. An image that establishes the directory's ownership during
+  its build can instead use path-only storage, after an application-specific fresh-volume check.
+- Separate local application evidence (2026-10-30): Handwriting Studio commit
+  `9502a77beb81dc1182ac14ba4a0543d2a28496cd`, Linux amd64 image
+  `sha256:946019395d9ee313df1496e2f65041b459a596c37d9e5839819588956270b840`, wrote SQLite and files as UID/GID
+  `10001:10001` on a fresh `/data` volume through the Docker runtime adapter. This proof is outside the repository's
+  CI suite; it does not establish permissions on an existing volume, general initialization support, remote helper
+  recovery, or a production deployment.
+
+## Generic Docker profile
+
+- Unit: `tests/test_cli.py` checks explicit generic configuration and rejects native use before creating files.
+  `tests/test_storage.py` checks release-record round trips and refuses unsupported generic/storage combinations
+  before a plan or job. `tests/test_github.py` checks the workflow guard before keys, secrets, or files change.
+- Runtime: `tests/test_runtime.py` checks shared environment injection, legacy labels, and profile identity.
+- Real Docker: `test_template_change_rollback_and_journal_recovery_restore_the_correct_environment` in
+  `tests/test_deploy_integration.py` changes only the profile for one image/commit/sequence. It verifies image
+  defaults, persistent files, rollback after a routing failure, recovery after an interrupted transaction,
+  and deliberate rollback. The interruption is simulated in the journal; the containers and environment
+  checks use real Docker.
+- CLI end to end: `tests/test_e2e.py` provisions a generic application beside an ADK application through
+  real SSH, sudo, Caddy, Docker, and the installed helper. It checks distinct environment contracts,
+  storage isolation, and restoration after the generic candidate fails readiness.
+- This profile does not implement ownership initialization, rate limits, generic workflow generation, or
+  native generic binaries. It does not establish that a particular application is ready for production.
 
 ## Not verified, and why
 

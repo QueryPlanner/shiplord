@@ -221,6 +221,7 @@ class DockerRuntime:
         argv = ["run", "--detach", "--name", self.container_name(registration, release),
                 "--label", f"shiplord.app={registration['application_id']}",
                 "--label", f"shiplord.release={release_id(release)}",
+                "--label", f"shiplord.template={config['template']}",
                 "--restart", "unless-stopped", "--memory", memory, "--memory-swap", memory, "--pids-limit", "512",
                 "--log-driver", "json-file", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
                 "--security-opt", "no-new-privileges", "--cap-drop", "ALL", "--stop-timeout", "10",
@@ -228,9 +229,10 @@ class DockerRuntime:
                 "--volume", f"{self.volume_name(registration)}:{container_path(config)}"]
         if custom is not None:
             argv += ["--env-file", str(self.layout.environments / registration["application_id"] / "app.env")]
-        managed = {"HOST": "0.0.0.0", "PORT": str(http["container_port"]), "AGENT_DIR": "/app/src",
-                   "AGENT_NAME": registration["application_id"], "LOG_LEVEL": "INFO", "RELOAD_AGENTS": "false",
-                   "SERVE_WEB_INTERFACE": "false", "ALLOW_ORIGINS": json.dumps(http["frontend_origins"])}
+        managed = {"HOST": "0.0.0.0", "PORT": str(http["container_port"]), "LOG_LEVEL": "INFO"}
+        if config["template"] == "google-adk":
+            managed.update(AGENT_DIR="/app/src", AGENT_NAME=registration["application_id"], RELOAD_AGENTS="false",
+                           SERVE_WEB_INTERFACE="false", ALLOW_ORIGINS=json.dumps(http["frontend_origins"]))
         for key, value in managed.items():  # after --env-file, so the managed values win
             argv += ["--env", f"{key}={value}"]
         argv.append(release["artifact"]["image"])
@@ -239,7 +241,7 @@ class DockerRuntime:
             raise RuntimeFailure("the container could not be started", "start", result.output)
 
     def is_running(self, registration: dict, release: dict) -> bool:
-        """Is the container for exactly this release running with its image and storage mount?
+        """Is the container running with this release's image, profile, and storage mount?
 
         The container name does not encode configuration, so a name and a readiness answer alone could
         accept a container that still has the previous mount path. A crash-looping container reports
@@ -247,19 +249,23 @@ class DockerRuntime:
         """
         result = self._docker(["inspect", "--format",
                                "{{.State.Running}} {{.State.Restarting}} {{.Config.Image}}"
-                               "{{range .Mounts}} {{.Type}}:{{.Name}}:{{.Destination}}{{end}}",
+                               "{{range .Mounts}} {{.Type}}:{{.Name}}:{{.Destination}}{{end}}|"
+                               "{{index .Config.Labels \"shiplord.template\"}}",
                                self.container_name(registration, release)], "inspect")
         if result.code != 0:
             return False
-        fields = result.output.split()
-        if len(fields) < 3:
+        state, separator, template = result.output.strip().partition("|")
+        fields = state.split()
+        if not separator or len(fields) < 3:
             return False
+        # Containers from helpers predating profiles have no label and use the ADK contract.
+        template = "google-adk" if template in {"", "<no value>"} else template
         running, restarting, image, *mounts = fields
         expected = f"volume:{self.volume_name(registration)}:{container_path(release['configuration'])}"
         # Docker adds one anonymous mount for every VOLUME instruction in an image. Those are compatible when the
         # Shiplord-managed volume is still present exactly once at the configured path.
         return (running, restarting) == ("true", "false") and _digest(image) == _digest(release["artifact"]["image"]) \
-            and mounts.count(expected) == 1
+            and mounts.count(expected) == 1 and template == release["configuration"]["template"]
 
     def logs(self, registration: dict, tail: int) -> str:
         tail = max(1, min(int(tail), MAX_LOG_LINES))

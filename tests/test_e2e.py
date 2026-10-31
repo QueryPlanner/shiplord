@@ -429,7 +429,7 @@ else: sys.exit("unsupported: " + " ".join(args))
                     raise
                 time.sleep(0.3)
 
-    def test_23_a_second_application_is_isolated_from_the_first(self):
+    def test_23_a_generic_application_is_isolated_from_the_adk_application(self):
         second = "second-" + secrets.token_hex(3)
         type(self).second_app = second
         self.addCleanup(lambda: [fixtures.docker("rm", "-f", c, check=False) for c in self.containers_of(second)])
@@ -438,7 +438,7 @@ else: sys.exit("unsupported: " + " ".join(args))
         project.mkdir(exist_ok=True)
         type(self).project2 = project
         self.cli("configure", "--name", second, "--server", "production", "--api-domain", "second.example.test",
-                 "--no-frontend", check=0, cwd=project)
+                 "--no-frontend", "--template", "generic", check=0, cwd=project)
         manifest = project / "ship.toml"
         manifest.write_text(manifest.read_text() + '\n[github]\nrepository = "shiplord/fixture"\ndeployment_branch = "main"\n')
         first_containers = self.containers_of(self.app)
@@ -450,6 +450,10 @@ else: sys.exit("unsupported: " + " ".join(args))
         result = json.loads(self.cli("deploy", "--image", image["image"], "--commit", image["commit"], "--sequence", "100",
                                      "--no-verify-public", "--json", check=0, cwd=project).stdout)
         self.assertEqual(result["status"], "succeeded")
+        generic_environment = json.loads(self.get_from(self.port2, "/env"))
+        self.assertEqual(generic_environment["AGENT_NAME"], "image-default")
+        self.assertIsNone(generic_environment["SERVE_WEB_INTERFACE"])
+        self.assertEqual(json.loads(self.get("/env"))["AGENT_NAME"], self.app)
         self.assertEqual((self.get_from(self.port2, "/version"), self.get_from(self.port, "/version")), ("v1", "v2"))
         self.assertEqual(self.containers_of(self.app), first_containers)  # the first application was not touched
         self.assertEqual(self.get_from(self.port2, "/counter"), "1")  # its own volume, not the first one's counter
@@ -458,6 +462,7 @@ else: sys.exit("unsupported: " + " ".join(args))
         failed = self.cli("deploy", "--image", bad["image"], "--commit", bad["commit"], "--sequence", "101", "--no-verify-public",
                           "--json", check=5, cwd=project)
         self.assertEqual(json.loads(failed.stdout)["status"], "rolled_back")
+        self.assertEqual(json.loads(self.get_from(self.port2, "/env"))["AGENT_NAME"], "image-default")
         self.assertEqual(self.containers_of(self.app), first_containers)
         self.assertEqual(self.get("/version"), "v2")
 

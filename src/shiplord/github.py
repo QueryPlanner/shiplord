@@ -249,6 +249,13 @@ def detect_tooling_ref() -> str | None:
 
 # --- operations ---------------------------------------------------------------------------
 
+def validate_setup_profile(manifest: dict) -> None:
+    """Reject unsupported workflow generation before callers collect settings or credentials."""
+    if manifest["template"] == "generic":
+        raise GitHubError("github setup generates an ADK workflow; generic Docker applications need a custom "
+                          "workflow invoking `shiplord deploy`", 2, "configuration")
+
+
 def _verify_ci_access(application_id: str, host: str, port: int, private: Path,
                       keys: list[tuple[str, str]], runner=run_ssh) -> None:
     """Prove the CI key works against the pinned host keys, exactly as the workflow will use it.
@@ -271,6 +278,7 @@ def github_setup(manifest: dict, repository: str, *, project: Path, admin: Admin
                  tailscale: Mapping[str, str] | None = None, force_workflow: bool = False, home: Path | None = None,
                  runner=run_ssh, host_keys: Callable[[str], list[tuple[str, str]]] | None = None,
                  resolve: Callable[[str], tuple[str, int]] = resolve_ssh_host) -> dict:
+    validate_setup_profile(manifest)
     if not _REPOSITORY.fullmatch(repository):
         raise GitHubError("--repo must be owner/repository", 2)
     if "github" in manifest and manifest["github"]["repository"] != repository:

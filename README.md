@@ -84,6 +84,38 @@ x86-64 and arm64 are supported), for example in CI. The binary is uploaded over 
 verified by size, SHA-256 and ELF header on the server, and run as an unprivileged account under a confined
 systemd unit.
 
+## Existing Docker applications
+
+Use the generic profile to deploy an existing image without Google ADK settings:
+
+```sh
+shiplord configure --name handwriting --server production \
+  --api-domain handwriting.example.com --no-frontend --template generic
+```
+
+This creates `template = "generic"` and `runtime = "docker"`. Edit the generated port, readiness path,
+memory, and storage to match your image before provisioning or deploying. The configure defaults remain
+8080, `/ready`, and 512 MiB; they are examples, not requirements for generic images. The image must start
+its own HTTP service, listen on `0.0.0.0` at `http.container_port`, and return HTTP 200 at `http.readiness_path`.
+An image can serve both its website and API at the configured hostname.
+
+Both profiles receive `HOST`, `PORT`, and `LOG_LEVEL`. Only `google-adk` receives Shiplord's `AGENT_DIR`,
+`AGENT_NAME`, `RELOAD_AGENTS`, `SERVE_WEB_INTERFACE`, and `ALLOW_ORIGINS` settings. Generic images keep
+their own defaults for those five variables and must implement their own CORS behavior when needed.
+All managed variable names remain reserved in `shiplord env set`, including ADK names, because environment
+files belong to the application and can survive a profile change.
+
+`configure` defaults to `google-adk` for compatibility. `init` still scaffolds only `google-adk`, and native
+binaries still require that profile. `github setup` generates the ADK template's workflow and refuses generic
+applications before creating keys or changing GitHub; use a custom workflow that builds your image, runs
+your application's checks, and invokes `shiplord deploy` by digest.
+
+The CLI requires the helper capability `docker_generic_v1` before submitting a generic plan or deploy.
+Upgrade with `shiplord server bootstrap` when it is missing. Do not downgrade to a helper that cannot read
+generic release records. Changing the profile replaces the container even with the same image, commit,
+and sequence; rollback and journal recovery restore the recorded profile. Containers without a profile
+label are interpreted as legacy `google-adk` containers.
+
 ## Persistent storage (Docker)
 
 Each Docker application has one named volume, `shiplord-<application>-artifacts`, mounted at `/app/src/.adk` by
@@ -109,6 +141,9 @@ slashes), and may not be, or be inside, `/proc`, `/sys`, `/dev`, `/run`, `/etc`,
   use `[storage]`.
 - `owner_uid` / `owner_gid` are validated but **not yet supported**: the helper rejects them, because establishing
   ownership safely needs a pinned initializer image that has not been built and reviewed.
+- An image can establish the mount directory's ownership during its build. Verify a fresh volume is writable
+  by the image's application user with real Docker before deployment. Shiplord does not repair existing
+  volume permissions, and changing the mount path does not migrate data from another application.
 
 ## Deploying from GitHub Actions
 

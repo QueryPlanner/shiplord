@@ -13,10 +13,10 @@ from shiplord.system import CommandError, CommandResult
 ID_A, ID_B = "a" * 64, "b" * 64
 
 
-def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=512, storage=None):
+def release(commit="a", image="b", sequence=1000, port=8080, origins=(), memory=512, storage=None, template="google-adk"):
     value = {"commit": commit * 40, "sequence": sequence,
             "artifact": {"kind": "docker", "image": "ghcr.io/example/orders@sha256:" + image * 64},
-            "configuration": {"schema_version": 1, "name": "orders", "server": "production", "template": "google-adk",
+            "configuration": {"schema_version": 1, "name": "orders", "server": "production", "template": template,
                               "runtime": "docker", "http": {"api_domain": "orders.example.com",
                               "frontend_origins": list(origins), "container_port": port, "readiness_path": "/ready"},
                               "resources": {"memory_mb": memory},
@@ -141,6 +141,12 @@ class StartTests(RuntimeTestCase):
         self.runtime.start(REGISTRATION, release(**kwargs))
         return self.docker.sub("run")[0]
 
+    def test_generic_runs_with_only_the_shared_managed_environment(self):
+        argv = self.start(template="generic")
+        environment = {argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--env"}
+        self.assertEqual(environment, {"HOST=0.0.0.0", "PORT=8080", "LOG_LEVEL=INFO"})
+        self.assertIn("shiplord.template=generic", argv)
+
     def test_replaces_existing_containers_then_runs_the_release_with_confinement(self):
         argv = self.start(origins=["https://orders.example.com"])
         names = [c[1] for c in self.docker.calls]
@@ -216,8 +222,18 @@ class StartTests(RuntimeTestCase):
 
 
 class InspectTests(RuntimeTestCase):
-    def inspect_output(self, state="true false", image="b", mounts=("volume:shiplord-orders-artifacts:/app/src/.adk",)):
-        return CommandResult(0, f"{state} ghcr.io/example/orders@sha256:{image * 64} {' '.join(mounts)}\n")
+    def inspect_output(self, state="true false", image="b", mounts=("volume:shiplord-orders-artifacts:/app/src/.adk",),
+                       template="google-adk"):
+        return CommandResult(0, f"{state} ghcr.io/example/orders@sha256:{image * 64} {' '.join(mounts)}|{template}\n")
+
+    def test_profile_changes_require_a_new_container_even_with_the_same_image_and_identity(self):
+        for actual in ("generic", "google-adk", "", "<no value>", "unknown", "google-adk|generic"):
+            with self.subTest(actual=actual):
+                self.docker.results["inspect"] = self.inspect_output(template=actual)
+                self.assertEqual(self.runtime.is_running(REGISTRATION, release()), actual in {"google-adk", "", "<no value>"})
+                self.assertEqual(self.runtime.is_running(REGISTRATION, release(template="generic")), actual == "generic")
+        self.docker.results["inspect"] = CommandResult(0, self.inspect_output().output.split("|")[0])
+        self.assertFalse(self.runtime.is_running(REGISTRATION, release()))
 
     def test_is_running_reads_the_release_container_state(self):
         self.docker.results["inspect"] = self.inspect_output()
@@ -249,7 +265,7 @@ class InspectTests(RuntimeTestCase):
 
     def test_a_registry_alias_does_not_change_the_identity_but_a_digest_does(self):
         mirrored = CommandResult(0, "true false localhost:5000/example/orders@sha256:" + "b" * 64
-                                 + " volume:shiplord-orders-artifacts:/app/src/.adk\n")
+                                 + " volume:shiplord-orders-artifacts:/app/src/.adk|google-adk\n")
         self.docker.results["inspect"] = mirrored
         self.assertTrue(self.runtime.is_running(REGISTRATION, release()))
         self.docker.results["inspect"] = CommandResult(0, mirrored.output.replace("b" * 64, "c" * 64))
