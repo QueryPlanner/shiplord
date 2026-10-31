@@ -90,6 +90,11 @@ class ManifestTests(unittest.TestCase):
 
 
 class LegacyRecordTests(unittest.TestCase):
+    def test_generic_records_keep_the_explicit_profile(self):
+        raw = record()
+        raw["configuration"]["template"] = "generic"
+        self.assertEqual(validate_release(raw, "orders"), raw)
+
     def test_a_legacy_release_record_loads_equal_to_its_raw_form(self):
         raw = record()
         before = copy.deepcopy(raw)
@@ -153,6 +158,30 @@ class NegotiationTests(ClientTestCase):
 
     def test_a_current_helper_advertises_the_feature(self):
         self.assertIn("docker_storage_v1", self.client.call("capabilities")["actions"])
+        self.assertIn("docker_generic_v1", self.client.call("capabilities")["actions"])
+
+    def test_combined_features_negotiate_once_before_any_plan_or_job(self):
+        manifest = self.storage_manifest() | {"template": "generic"}
+        manifest["deploy"].update(shutdown_timeout_seconds=8, shutdown_timeout_action="fail")
+        supported = ["docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"]
+        for operation in (commands.plan_application, commands.deploy_application):
+            with self.subTest(operation=operation.__name__):
+                for features in ([], *(supported[:i] + supported[i + 1:] for i in range(len(supported)))):
+                    with patch.object(self.client, "call", return_value={"actions": features}) as call:
+                        with self.assertRaises(CommandError) as caught:
+                            operation(manifest, self.client, image=IMAGE, commit=COMMIT, sequence=1)
+                        self.assertEqual(caught.exception.code, 4)
+                        self.assertIn("shiplord server bootstrap", str(caught.exception))
+                        self.assertEqual([c.args[0] for c in call.call_args_list], ["capabilities"])
+        with patch.object(self.client, "call", return_value={"actions": supported}) as call:
+            commands.require_feature_support(manifest, self.client)
+            call.assert_called_once_with("capabilities")
+
+    def test_a_generic_plan_through_the_helper_creates_no_job(self):
+        manifest = validate_manifest(configuration() | {"template": "generic"})
+        code, _ = commands.plan_application(manifest, self.client, image=IMAGE, commit=COMMIT, sequence=1000)
+        self.assertEqual(code, 0)
+        self.assertEqual(os.listdir(self.layout.jobs / "orders"), [])
 
     def test_a_helper_without_the_feature_is_refused_before_any_job_or_plan_call(self):
         old = {"status": "ok", "request_id": "x", "version": 1, "helper_version": "0.1.0",

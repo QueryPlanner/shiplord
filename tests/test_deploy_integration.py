@@ -31,6 +31,7 @@ from shiplord.probes import Probes  # noqa: E402
 from shiplord.registry import PORT_RANGE, port_is_free, validate_registration  # noqa: E402
 from shiplord.release_state import HostLock, ReleaseState  # noqa: E402
 from shiplord.routing import RouteManager  # noqa: E402
+from shiplord.routing import RoutingError  # noqa: E402
 from shiplord.runtime import DockerRuntime, release_id  # noqa: E402
 from shiplord.system import HostSystem  # noqa: E402
 
@@ -58,6 +59,9 @@ if os.environ.get("MODE") == "graceful":
     signal.signal(signal.SIGTERM, drain)
 elif os.environ.get("MODE") == "ignore":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+elif os.environ.get("MODE") in ("healthy", "unhealthy"):
+    # PID 1 must explicitly handle TERM; only the ignore fixture should refuse shutdown.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 DATA = os.environ.get("DATA_DIR", "/app/src/.adk")  # the legacy path unless a test points the app elsewhere
 ARTIFACTS = DATA
 
@@ -71,7 +75,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/whoami":
             body = str(os.getuid()).encode()
         elif self.path == "/env":
-            keys = ("ALLOW_ORIGINS", "SERVE_WEB_INTERFACE", "RELOAD_AGENTS", "AGENT_NAME", "HOST", "PORT", "AGENT_DIR", "CUSTOM_TOKEN")
+            keys = ("ALLOW_ORIGINS", "SERVE_WEB_INTERFACE", "RELOAD_AGENTS", "AGENT_NAME", "HOST", "PORT", "AGENT_DIR", "CUSTOM_TOKEN", "DATA_DIR")
             body = json.dumps({k: os.environ.get(k) for k in keys}).encode()
         elif self.path == "/drained":
             path = os.path.join(DATA, "drained")
@@ -99,12 +103,12 @@ print("fixture started version=" + os.environ["VERSION"], flush=True)
 http.server.ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT"])), Handler).serve_forever()
 '''
 DOCKERFILE = '''FROM python:3.12-slim
-RUN useradd -u 1000 -m app && mkdir -p /app/src/.adk /data && chown -R app:app /app
+RUN useradd -u 1000 -m app && mkdir -p /app/src/.adk /data && chown -R app:app /app /data
 USER app
 ARG VERSION
 ARG MODE=healthy
 ARG REVISION
-ENV VERSION=$VERSION MODE=$MODE
+ENV VERSION=$VERSION MODE=$MODE AGENT_NAME=image-default AGENT_DIR=/image/agents
 LABEL org.opencontainers.image.revision=$REVISION
 COPY server.py /app/server.py
 CMD ["python", "/app/server.py"]
@@ -480,6 +484,51 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertIn((f"shiplord-{self.app}-artifacts", "/app/src/.adk"), mounts)
         self.assertTrue(any(destination == "/scratch" for _, destination in mounts))
         self.assertTrue(self.runtime.is_running(self.registration, self.state.read_state()["current"]))
+
+    def test_template_change_rollback_and_journal_recovery_restore_the_correct_environment(self):
+        self.set_data_dir("/app/src/.adk")
+        adk = self.policy_configuration(8, "fail")
+        generic = adk | {"template": "generic"}
+        self.assertOutcome(self.deploy("req-profile1", "v1", 5001, configuration=adk), "succeeded")
+        counter = int(self.get("/counter"))
+        first = self.state.read_state()["current"]
+        self.assertEqual(json.loads(self.get("/env"))["AGENT_NAME"], self.app)
+
+        # Same image, commit, sequence, path, and port; only the application profile differs.
+        self.assertOutcome(self.deploy("req-profile2", "v1", 5001, configuration=generic), "succeeded")
+        current = self.state.read_state()["current"]
+        self.assertEqual(release_id(first), release_id(current))
+        environment = json.loads(self.get("/env"))
+        self.assertEqual((environment["AGENT_NAME"], environment["AGENT_DIR"]), ("image-default", "/image/agents"))
+        for key in ("ALLOW_ORIGINS", "SERVE_WEB_INTERFACE", "RELOAD_AGENTS"):
+            self.assertIsNone(environment[key], key)
+        self.assertEqual((environment["HOST"], environment["PORT"]), ("0.0.0.0", "8080"))
+        self.assertEqual(self.get("/counter"), str(counter + 1))
+        self.assertFalse(self.runtime.is_running(self.registration, first))
+
+        with patch.object(self.deployer.routes, "apply", side_effect=RoutingError("fixture routing failure", "reload")):
+            failed = self.deploy("req-profile3", "v1", 5001, configuration=adk)
+        self.assertOutcome(failed, "rolled_back")
+        self.assertEqual(json.loads(self.get("/env"))["AGENT_NAME"], "image-default")
+        self.assertTrue(self.runtime.is_running(self.registration, current))
+        self.assertIsNone(self.state.read_journal())
+
+        # Simulate interruption after the candidate starts but before its state is committed.
+        candidate = current | {"configuration": adk}
+        with self.lock.acquire():
+            self.state.begin("req-profile4", candidate)
+            self.state.advance("runtime-changing")
+            self.runtime.start(self.registration, candidate)
+        self.assertEqual(json.loads(self.get("/env"))["AGENT_NAME"], self.app)
+        with self.lock.acquire():
+            recovered = self.deployer.recover()
+        self.assertOutcome(recovered, "recovered")
+        self.assertEqual(json.loads(self.get("/env"))["AGENT_NAME"], "image-default")
+        self.assertEqual(self.get("/counter"), str(counter + 2))
+        self.assertIsNone(self.state.read_journal())
+
+        self.assertOutcome(self.runtime_rollback("req-profile5"), "succeeded")
+        self.assertEqual(json.loads(self.get("/env"))["AGENT_NAME"], self.app)
 
     def runtime_rollback(self, request_id):
         with self.lock.acquire():

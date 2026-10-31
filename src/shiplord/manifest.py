@@ -19,6 +19,7 @@ class ManifestError(ValueError):
 _NAME = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 _DOMAIN_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+GENERIC_DOCKER_FEATURE = "docker_generic_v1"
 
 
 def _table(value: object, name: str, allowed: set[str]) -> dict:
@@ -112,11 +113,13 @@ def validate_manifest(raw: dict) -> dict:
     if len(server) > 48 or not _NAME.fullmatch(server):
         raise ManifestError("server must be a lowercase server alias")
     template = _string(root.get("template"), "template")
-    if template != "google-adk":
-        raise ManifestError("template must be google-adk")
+    if template not in {"google-adk", "generic"}:
+        raise ManifestError("template must be google-adk or generic")
     runtime = _string(root.get("runtime"), "runtime")
     if runtime not in {"docker", "native"}:
         raise ManifestError("runtime must be docker or native")
+    if template == "generic" and runtime != "docker":
+        raise ManifestError("the generic template requires the docker runtime")
 
     http = _table(root.get("http"), "http", {"api_domain", "frontend_origins", "container_port", "readiness_path"})
     domain = _hostname(http.get("api_domain"), "http.api_domain")

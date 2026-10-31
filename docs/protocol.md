@@ -50,6 +50,10 @@ application is denied (`{"status": "error", "error": "access_denied"}`, exit 3).
 response fields but accepts any extra name). `docker_storage_v1` means the helper honours `[storage]` in a Docker
 `configuration`; it validates `storage.container_path` itself, independent of the client. `plan` adds
 `storage: {current_path, candidate_path, same_volume, note}` for Docker applications.
+`docker_generic_v1` means the helper accepts `template = "generic"` with `runtime = "docker"`, injects only
+the shared `HOST`, `PORT`, and `LOG_LEVEL` environment, and checks the container's `shiplord.template` label
+when reconciling a release. Missing labels retain the legacy `google-adk` meaning. The client checks all
+requested optional features in one capabilities call before submitting `plan` or `deploy`.
 
 `docker_shutdown_v1` means the helper honours `deploy.shutdown_timeout_seconds` / `shutdown_timeout_action`. `plan` adds
 `shutdown: {outgoing_policy, candidate_policy, note}`, and a finished deploy may include `shutdown` stage reports

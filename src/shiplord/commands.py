@@ -16,6 +16,7 @@ from .environment import EnvironmentError_, parse_environment
 from .client import AdminClient, ClientError, HelperClient, new_request_id, submit_and_wait
 from .keys import KeyError_, parse_public_key
 from .native import elf_architecture
+from .manifest import GENERIC_DOCKER_FEATURE
 from .runtime import RuntimeFailure
 from .shutdown import FEATURE as SHUTDOWN_FEATURE
 from .storage import FEATURE as STORAGE_FEATURE
@@ -228,16 +229,21 @@ def uses_shutdown_policy(manifest: dict) -> bool:
 
 
 def require_feature_support(manifest: dict, client: HelperClient) -> None:
-    """Refuse explicit settings on a helper that would ignore them, before any plan or job exists."""
-    needed = [(STORAGE_FEATURE, "[storage]")] * ("storage" in manifest) \
-        + [(SHUTDOWN_FEATURE, "shutdown_timeout_*")] * uses_shutdown_policy(manifest)
-    if not needed:
+    """Refuse settings an older helper would ignore, before submitting a plan or a job."""
+    required = {}
+    if "storage" in manifest:
+        required[STORAGE_FEATURE] = "[storage]"
+    if uses_shutdown_policy(manifest):
+        required[SHUTDOWN_FEATURE] = "shutdown_timeout_*"
+    if manifest["template"] == "generic":
+        required[GENERIC_DOCKER_FEATURE] = "template = generic"
+    if not required:
         return
-    advertised = client.call("capabilities")["actions"]
-    for feature, name in needed:
-        if feature not in advertised:
-            raise CommandError(f"the server helper does not support {name}; re-run `shiplord server bootstrap` "
-                               "to upgrade it, then retry", 4)
+    supported = client.call("capabilities")["actions"]
+    missing = [setting for feature, setting in required.items() if feature not in supported]
+    if missing:
+        raise CommandError("the server helper does not support " + ", ".join(missing) +
+                           "; re-run `shiplord server bootstrap` to upgrade it, then retry", 4)
 
 
 def job_timeout(manifest: dict) -> float:

@@ -44,6 +44,12 @@ class ManifestTests(unittest.TestCase):
         result = self.load(MANIFEST.replace('["https://orders.example.com"]', '[]'))
         self.assertEqual(result["http"]["frontend_origins"], [])
 
+    def test_generic_is_an_explicit_docker_profile(self):
+        contents = MANIFEST.replace('template = "google-adk"', 'template = "generic"')
+        self.assertEqual(self.load(contents)["template"], "generic")
+        with self.assertRaisesRegex(ManifestError, "generic template requires the docker runtime"):
+            self.load(contents.replace('runtime = "docker"', 'runtime = "native"'))
+
     def test_invalid_fields_are_rejected_without_echoing_values(self):
         replacements = [
             ("schema_version = 1", "schema_version = 2"),
@@ -237,6 +243,31 @@ class CLITests(unittest.TestCase):
             result = self.invoke(directory, "configure", "--name", "orders", "--server", "production", "--api-domain", "api.example.com", "--no-frontend")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(load_manifest(Path(directory) / "ship.toml")["http"]["frontend_origins"], [])
+
+    def test_configure_generic_validates_before_creating_any_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = ["configure", "--name", "orders", "--server", "production", "--api-domain", "api.example.com",
+                    "--no-frontend", "--template", "generic"]
+            rejected = self.invoke(directory, *args, "--runtime", "native")
+            self.assertEqual(rejected.returncode, 2, rejected.stderr)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            accepted = self.invoke(directory, *args)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(load_manifest(Path(directory) / "ship.toml")["template"], "generic")
+
+    def test_generic_github_setup_rejects_before_saving_tailscale_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ship.toml").write_text(MANIFEST.replace('template = "google-adk"', 'template = "generic"'))
+            config_home = root / "config"
+            result = self.invoke(directory, "github", "setup", "--repo", "QueryPlanner/orders",
+                                 "--tailscale-client-id", "throwaway-fixture", "--tailscale-audience",
+                                 "api.tailscale.com/throwaway-fixture", "--json",
+                                 env=dict(os.environ, XDG_CONFIG_HOME=str(config_home)))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("generic Docker applications need a custom workflow", json.loads(result.stdout)["error"])
+            self.assertFalse(config_home.exists())
+            self.assertEqual(list(root.iterdir()), [root / "ship.toml"])
 
     def test_configure_refuses_ambiguous_or_invalid_inputs(self):
         cases = [[], ["--frontend", "https://example.com", "--no-frontend"], ["--frontend", "https://example.com/path"]]

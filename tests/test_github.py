@@ -180,6 +180,19 @@ class GitHubTestCase(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("ssh-keygen"), "ssh-keygen is required")
 class SetupTests(GitHubTestCase):
+    def test_generic_setup_is_refused_before_keys_secrets_or_files_are_changed(self):
+        config = manifest() | {"template": "generic"}
+        before = (self.project / "ship.toml").read_bytes()
+        with patch.object(github, "generate_ci_key", side_effect=AssertionError("must not create a key")):
+            with self.assertRaisesRegex(GitHubError, "generic Docker applications need a custom workflow") as caught:
+                self.setup_call(manifest=config)
+        self.assertEqual((caught.exception.code, caught.exception.step), (2, "configuration"))
+        self.assertEqual(self.gh_runner.calls, [])
+        self.assertEqual((self.server.admin_calls, self.server.ssh_events), ([], []))
+        self.assertFalse(self.home.exists())
+        self.assertEqual(list(self.project.iterdir()), [self.project / "ship.toml"])
+        self.assertEqual((self.project / "ship.toml").read_bytes(), before)
+
     def test_setup_registers_proves_then_stores_the_key_sets_variables_and_writes_the_workflow(self):
         result = self.setup_call()
         order = self.gh_runner.order()

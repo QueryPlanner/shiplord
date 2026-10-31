@@ -15,10 +15,10 @@ class ConfigurationError(ValueError):
 
 
 def create_manifest(directory: Path, name: str, server: str, api_domain: str,
-                    origins: list[str], runtime: str = "docker") -> Path:
+                    origins: list[str], runtime: str = "docker", template: str = "google-adk") -> Path:
     config = validate_manifest({
         "schema_version": 1, "name": name, "server": server,
-        "template": "google-adk", "runtime": runtime,
+        "template": template, "runtime": runtime,
         "http": {"api_domain": api_domain, "frontend_origins": origins,
                  "container_port": 8080, "readiness_path": "/ready"},
         "resources": {"memory_mb": 512},
@@ -28,7 +28,7 @@ def create_manifest(directory: Path, name: str, server: str, api_domain: str,
     origin_list = ", ".join(quote(origin) for origin in config["http"]["frontend_origins"])
     content = (
         f'schema_version = 1\nname = {quote(config["name"])}\n'
-        f'server = {quote(config["server"])}\ntemplate = "google-adk"\n'
+        f'server = {quote(config["server"])}\ntemplate = {quote(config["template"])}\n'
         f'runtime = {quote(config["runtime"])}\n\n'
         f'[http]\napi_domain = {quote(config["http"]["api_domain"])}\n'
         f'frontend_origins = [{origin_list}]\ncontainer_port = 8080\n'

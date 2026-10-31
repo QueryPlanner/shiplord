@@ -53,8 +53,15 @@ Storage: the application volume is never removed by deploy, rollback, recover, r
 refused with phase `storage`, the volume has another driver, driver options, another application's label, or no retained
 Shiplord container proving that an unlabelled legacy volume belongs to this application. Inspect it with
 `docker volume inspect` as an administrator and resolve it deliberately. A running container is recognised only when
-its image digest and exactly one Shiplord volume mount match the release. Extra image-declared mounts are allowed, so an
-image `VOLUME` instruction does not make a healthy release appear absent.
+its image digest, application profile, shutdown policy, and exactly one Shiplord volume mount match the release.
+Extra image-declared mounts are allowed, so an image `VOLUME` instruction does not make a healthy release appear absent.
+
+Generic Docker applications use `template = "generic"`; Shiplord still owns the volume name and port binding.
+The application image owns its process startup, CORS, and any website routes. Shiplord supplies no upload or
+generation rate limits. Keep any existing traffic protections when moving an application behind the Shiplord route.
+The generated GitHub workflow supports only ADK; generic applications need their own CI workflow.
+After recording a generic release, retain a helper that supports `docker_generic_v1` for status, rollback,
+and recovery. An older helper cannot interpret the generic release record.
 
 An unfinished transaction may include a legacy-volume proof or a shutdown record in its journal. Recover that
 transaction before downgrading the helper, because an older helper cannot read these added journal fields. Older

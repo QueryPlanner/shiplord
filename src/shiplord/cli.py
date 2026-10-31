@@ -203,13 +203,14 @@ def configure(server: str = typer.Option(..., "--server"), api_domain: str = typ
               frontend: Optional[list[str]] = typer.Option(None, "--frontend"),
               no_frontend: bool = typer.Option(False, "--no-frontend"),
               name: Optional[str] = typer.Option(None, "--name"),
-              runtime: str = typer.Option("docker", "--runtime")) -> None:
+              runtime: str = typer.Option("docker", "--runtime"),
+              template: str = typer.Option("google-adk", "--template")) -> None:
     """Create ship.toml in the current directory without overwriting it."""
     if bool(frontend) == no_frontend:
         typer.echo("error: specify --frontend or explicitly choose --no-frontend", err=True)
         raise typer.Exit(2)
     try:
-        create_manifest(Path.cwd(), name or Path.cwd().name, server, api_domain, frontend or [], runtime)
+        create_manifest(Path.cwd(), name or Path.cwd().name, server, api_domain, frontend or [], runtime, template)
     except (ConfigurationError, ManifestError) as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from None
@@ -413,6 +414,7 @@ def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/rep
     manifest = _manifest(json_output)
 
     def action() -> tuple[int, dict]:
+        github.validate_setup_profile(manifest)
         given = _tailscale_settings(tailscale_client_id, tailscale_audience, tailscale_tags)
         gh = github.GitHub()
         interactive = sys.stdin.isatty() and not json_output

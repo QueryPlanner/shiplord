@@ -97,7 +97,7 @@ class SudoIntegrationTests(unittest.TestCase):
                 self.assertEqual(allowed.returncode, 0)
                 self.assertEqual(self.parse(allowed)["actions"],
                          ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover",
-                          "docker_storage_v1", "docker_shutdown_v1"])
+                          "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"])
                 denied = self.sudo(user, other)
                 self.assertEqual(denied.returncode, 3)
                 self.assertEqual(self.parse(denied)["error"], "access_denied")
