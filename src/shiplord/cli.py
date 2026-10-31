@@ -20,7 +20,8 @@ from .commands import CommandError
 from .configure import ConfigurationError, create_manifest
 from .manifest import ManifestError, load_manifest
 from .protocol import IncompatibleProtocol
-from .servers import InvalidTarget, ServerError, SshOptions, SSHCheckError, load_server, register_server, validate_target
+from .servers import (InvalidTarget, ServerError, SshOptions, SSHCheckError, list_servers, load_server, register_server,
+                      validate_target)
 from .template import TemplateError, create_project
 from .transport import TransportError, probe_capabilities
 
@@ -133,6 +134,25 @@ def server_add(alias: str, ssh: str = typer.Option(..., "--ssh")) -> None:
         code = 2 if isinstance(exc, (ManifestError, InvalidTarget)) else 3 if isinstance(exc, SSHCheckError) else 1
         raise typer.Exit(code) from None
     typer.echo("Server alias saved. Run `shiplord server bootstrap` next. CI host-key setup is not implemented yet.")
+
+
+@server_app.command("list")
+def server_list(json_output: bool = typer.Option(False, "--json")) -> None:
+    """List the registered servers (local only; nothing is contacted)."""
+    try:
+        servers, invalid = list_servers()
+    except ServerError as error:
+        _fail(str(error), 3, json_output)
+    if json_output:
+        _emit({"ok": True, "servers": servers, "invalid_entries": invalid}, True)
+        return
+    if not servers:
+        typer.echo("No servers registered. Add one with `shiplord server add <alias> --ssh <user>@<host>`.")
+    width = max((len(server["alias"]) for server in servers), default=0)
+    for server in servers:
+        typer.echo(f"{server['alias'].ljust(width)}  {server['ssh']}")
+    if invalid:
+        typer.echo(f"{invalid} invalid {'entry' if invalid == 1 else 'entries'} ignored in the server directory.")
 
 
 def _fail(message: str, code: int, json_output: bool = False) -> None:

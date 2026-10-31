@@ -29,6 +29,10 @@ class SSHCheckError(ServerError):
     """A trusted SSH login could not be verified."""
 
 
+class NoServerDirectory(ServerError):
+    """No server has been registered on this machine yet (the directory does not exist)."""
+
+
 def validate_target(target: str) -> str:
     if not isinstance(target, str) or target.count("@") != 1:
         raise InvalidTarget("SSH target must be user@host")
@@ -78,14 +82,16 @@ def _private_servers_directory(*, create: bool = True) -> int:
         except BaseException:
             os.close(current)
             raise
+    except FileNotFoundError:
+        if not create:
+            raise NoServerDirectory("could not access the private server configuration directory") from None
+        raise ServerError("could not access the private server configuration directory") from None
     except OSError:
         raise ServerError("could not access the private server configuration directory") from None
 
 
-def load_server(alias: str) -> str:
-    """Read a previously registered alias without creating local state."""
-    alias = validate_app_name(alias)
-    directory = _private_servers_directory(create=False)
+def _read_record(directory: int, alias: str) -> str:
+    """Read and validate one alias file inside the already opened private directory."""
     try:
         descriptor = os.open(alias + ".json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         with os.fdopen(descriptor, "rb") as file:
@@ -104,8 +110,47 @@ def load_server(alias: str) -> str:
         return validate_target(record["ssh"])
     except (OSError, UnicodeDecodeError, ValueError):
         raise ServerError("could not read a valid private server alias") from None
+
+
+def load_server(alias: str) -> str:
+    """Read a previously registered alias without creating local state."""
+    alias = validate_app_name(alias)
+    directory = _private_servers_directory(create=False)
+    try:
+        return _read_record(directory, alias)
     finally:
         os.close(directory)
+
+
+def list_servers() -> tuple[list[dict[str, str]], int]:
+    """Return the registered aliases (sorted) and how many entries could not be read, without creating local state.
+
+    Only files named ``<valid alias>.json`` are candidates, so a hostile file name is never echoed to a terminal; any
+    other entry, and any candidate that fails the same checks as ``load_server``, is only counted.
+    """
+    try:
+        directory = _private_servers_directory(create=False)
+    except NoServerDirectory:
+        return [], 0
+    servers, invalid = [], 0
+    try:
+        try:
+            with os.scandir(directory) as entries:
+                names = sorted(entry.name for entry in entries)
+        except OSError:
+            raise ServerError("could not list the private server configuration directory") from None
+        for name in names:
+            if name.startswith(".new-"):  # an unpublished temporary file from an interrupted `server add`
+                continue
+            alias = name[:-len(".json")] if name.endswith(".json") else None
+            try:
+                validate_app_name(alias)
+                servers.append({"alias": alias, "ssh": _read_record(directory, alias)})
+            except ValueError:  # ServerError and ManifestError are both ValueErrors
+                invalid += 1
+    finally:
+        os.close(directory)
+    return servers, invalid
 
 
 def _save_server(alias: str, target: str) -> None:

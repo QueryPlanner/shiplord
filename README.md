@@ -205,6 +205,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | Command | Purpose |
 | --- | --- |
 | `server add <alias> --ssh user@host` | Register a trusted SSH login. Never accepts or updates host keys. |
+| `server list` | Show the registered aliases and their SSH targets. Local only; contacts nothing. |
 | `server bootstrap <alias>` | Install or update the helper on the server. Idempotent. |
 | `init`, `configure` | Create a project from the pinned template; create `ship.toml`. |
 | `provision` | Create the application's account, state, port, and key access on the server. |
