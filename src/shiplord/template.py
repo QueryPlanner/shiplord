@@ -104,7 +104,7 @@ shiplord configure --server production --api-domain <api hostname> --frontend <o
 shiplord provision
 shiplord env set --from-file <file with DATABASE_URL, API keys, ...>
 shiplord registry login --username <user> --token-file <read-only token>   # only for a private image
-shiplord github setup --repo <owner>/<repository> --tooling-ref <shiplord commit>
+shiplord github setup --repo <owner>/<repository>   # add --tooling-ref <commit|branch|tag> to install unreleased code
 ```
 
 Create the DNS record for the API hostname yourself. Finish the Tailscale federation described in the output of

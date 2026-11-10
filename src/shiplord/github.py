@@ -22,13 +22,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
-from . import tailscale
+from . import __version__, tailscale
 from .client import AdminClient, ClientError, HelperClient, run_ssh
 from .keys import KeyError_, parse_public_key
 from .layout import deployment_user
 from .manifest import ManifestError, validate_manifest
 from .servers import SshOptions, _config_home, ssh_command
-from .workflow import TOOLING_REPOSITORY, WORKFLOW_PATH, WorkflowError, render_workflow
+from .workflow import WORKFLOW_PATH, WorkflowError, render_workflow
 
 SECRET_NAME = "SHIPLORD_SSH_PRIVATE_KEY"
 VARIABLES = ("SHIPLORD_SERVER_HOST", "SHIPLORD_DEPLOY_USER", "SHIPLORD_SSH_KNOWN_HOSTS")  # SHIPLORD_SSH_PORT is optional
@@ -235,18 +235,6 @@ def resolve_ssh_host(host: str, config: Path | None = None) -> tuple[str, int]:
     return settings.get("hostname", host), int(port) if port.isdigit() else 22
 
 
-def detect_tooling_ref() -> str | None:
-    """The commit of the Shiplord checkout this CLI runs from, if it is a git checkout."""
-    directory = Path(__file__).resolve().parent
-    try:
-        result = subprocess.run(["git", "-C", str(directory), "rev-parse", "HEAD"], capture_output=True, text=True,
-                                timeout=30, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    ref = result.stdout.strip()
-    return ref if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", ref) else None
-
-
 # --- operations ---------------------------------------------------------------------------
 
 def validate_setup_profile(manifest: dict) -> None:
@@ -374,13 +362,9 @@ def _write_workflow(manifest: dict, repository: str, project: Path, state: dict,
                     tooling_ref: str | None, platforms: str, force: bool) -> str:
     if manifest["runtime"] != "docker":
         return "skipped: generation covers Docker applications; call `shiplord deploy --binary` from your own build job"
-    ref = tooling_ref or detect_tooling_ref()
-    if ref is None:
-        raise GitHubError("cannot pin the Shiplord version for CI: pass --tooling-ref <commit sha> (a commit that is "
-                          "pushed to GitHub)", 2, "workflow")
     try:
         text = render_workflow(dict(manifest, github={"repository": repository, **manifest.get("github", {"deployment_branch": "main"})}),
-                               tooling_ref=ref, platforms=platforms)
+                               tooling_ref=tooling_ref, platforms=platforms)
     except WorkflowError as error:
         raise GitHubError(str(error), 2, "workflow") from None
     path = project / WORKFLOW_PATH
@@ -398,7 +382,7 @@ def _write_workflow(manifest: dict, repository: str, project: Path, state: dict,
     os.replace(temporary, path)
     state["workflow_sha256"] = digest
     _save_state(directory, state)
-    return f"written ({WORKFLOW_PATH}, Shiplord pinned at {ref[:12]})"
+    return f"written ({WORKFLOW_PATH}, Shiplord pinned at {tooling_ref[:12] if tooling_ref else __version__})"
 
 
 def _ensure_manifest_github(project: Path, manifest: dict, repository: str) -> None:
@@ -501,7 +485,8 @@ def github_status(manifest: dict, *, project: Path, gh: GitHub, admin: AdminClie
 
 
 CHECK_HINTS = {
-    "Install the pinned Shiplord": "the runner could not install Shiplord at the pinned commit; check that it is pushed",
+    "Install the pinned Shiplord": "the runner could not install the pinned Shiplord version; check that the version "
+                                   "is on PyPI, or that the --tooling-ref commit, branch, or tag is pushed",
     "Join the tailnet": "Tailscale refused the runner, or the server did not answer its ping: compare the trust "
                         "credential's subject with subject_expected, and check tag:ci in the tailnet policy",
     "Prepare the SSH identity and pinned host keys": "the CI secret or variables are missing; run `shiplord github setup`",

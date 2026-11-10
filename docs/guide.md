@@ -26,9 +26,13 @@ verified: the plan's controlled install on *your* production server (§12E). See
 Python 3.11 or later and OpenSSH are required on the machine you work from.
 
 ```sh
-python -m pip install .
+python -m pip install shiplord
 shiplord --help
 ```
+
+Shiplord is published on [PyPI](https://pypi.org/project/shiplord/). Pin a specific release with
+`python -m pip install shiplord==<version>`; the generated GitHub Actions workflow installs the same version as the
+CLI that generated it.
 
 ## How it fits together
 
@@ -179,12 +183,16 @@ shutdown_timeout_action = "fail" # "force" (default) or "fail"
 ## Deploying from GitHub Actions
 
 ```sh
-shiplord github setup --repo owner/orders --tooling-ref <commit of Shiplord pushed to GitHub>
+shiplord github setup --repo owner/orders
 git add .github/workflows/shiplord-release.yml ship.toml && git commit   # merge to the deployment branch
 shiplord github check-ci            # joins Tailscale and logs in with the CI key; builds and deploys nothing
 shiplord github status --check-server
 shiplord github rotate-key
 ```
+
+The generated workflow installs `shiplord==<version>` from PyPI, matching the CLI that generated it. To track a commit,
+branch, or tag instead (for example unreleased Shiplord code), pass `--tooling-ref <commit|branch|tag>`; Shiplord then
+installs from its GitHub repository at that reference.
 
 `github setup` uses your authenticated `gh`. It creates a dedicated Ed25519 CI key, registers it on the server,
 **proves it authenticates over SSH against the server's pinned host keys** (read over your already-trusted

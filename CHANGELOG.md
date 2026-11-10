@@ -7,6 +7,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+- Generate GitHub Actions workflows that install `shiplord==<version>` from PyPI by
+  default. `--tooling-ref` still installs a commit, branch, or tag from GitHub.
+
 ### Fixed
 
 - Detect helpers older than 0.2.0 before requesting app inventory and show the

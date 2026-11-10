@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from shiplord import github  # noqa: E402
+from shiplord import __version__, github  # noqa: E402
 from shiplord.client import ClientError  # noqa: E402
 from shiplord.framing import read_frame, write_frame  # noqa: E402
 from shiplord.github import (SECRET_NAME, GhResult, GitHub, GitHubError, check_ci, fetch_host_keys, generate_ci_key,  # noqa: E402
@@ -329,11 +329,17 @@ class SetupTests(GitHubTestCase):
         self.setup_call(manifest=manifest(with_github=True), force_workflow=True)
         self.assertNotIn("# my change", path.read_text())
 
-    def test_the_tooling_version_must_be_pinned_explicitly_when_it_cannot_be_detected(self):
-        with patch("shiplord.github.detect_tooling_ref", return_value=None), self.assertRaisesRegex(GitHubError, "--tooling-ref"):
-            self.setup_call(tooling_ref=None)
-        with patch("shiplord.github.detect_tooling_ref", return_value="ef" * 20):
-            self.assertIn("efefefefefef", self.setup_call(tooling_ref=None)["steps"]["workflow"])
+    def test_setup_without_a_tooling_ref_pins_the_running_version_from_pypi(self):
+        result = self.setup_call(tooling_ref=None)
+        workflow = (self.project / WORKFLOW_PATH).read_text()
+        self.assertIn(f'"shiplord=={__version__}"', workflow)
+        self.assertNotIn("git+https://github.com/QueryPlanner/shiplord", workflow)
+        self.assertIn(__version__, result["steps"]["workflow"])
+
+    def test_a_branch_tooling_ref_still_installs_from_git(self):
+        self.setup_call(tooling_ref="release/prod")
+        self.assertIn("git+https://github.com/QueryPlanner/shiplord.git@release/prod",
+                      (self.project / WORKFLOW_PATH).read_text())
 
     def test_native_applications_get_credentials_but_no_generated_workflow(self):
         (self.project / "ship.toml").write_text(MANIFEST_TOML.replace('runtime = "docker"', 'runtime = "native"'))

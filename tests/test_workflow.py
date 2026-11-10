@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import unittest
 
+from shiplord import __version__
 from shiplord.manifest import validate_manifest
 from shiplord.workflow import ACTIONS, WorkflowError, render_workflow
 
@@ -155,6 +156,14 @@ class WorkflowTests(unittest.TestCase):
         install = next(s for s in self.steps("deploy") if s.get("name") == "Install the pinned Shiplord")
         self.assertIn(f"git+https://github.com/QueryPlanner/shiplord.git@{REF}", install["run"])
 
+    def test_a_branch_reference_installs_from_git_at_that_branch(self):
+        text = render_workflow(manifest(), tooling_ref="release/prod")
+        install = next(s for s in parse(text)["jobs"]["deploy"]["steps"]
+                       if s.get("name") == "Install the pinned Shiplord")
+        self.assertEqual(install["run"],
+                         "python -m pip install --disable-pip-version-check "
+                         "\"git+https://github.com/QueryPlanner/shiplord.git@release/prod\"")
+
     def test_the_ssh_identity_is_removed_even_when_the_deploy_fails(self):
         cleanup = self.steps("deploy")[-1]
         self.assertEqual(cleanup["if"], "${{ always() }}")
@@ -184,13 +193,33 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/release/prod'", data["jobs"]["deploy"]["if"])
 
     def test_invalid_inputs_are_refused(self):
-        for kwargs in ({"tooling_ref": "main"}, {"tooling_ref": REF[:-1]}, {"tooling_ref": REF, "platforms": "linux/386"},
+        for kwargs in ({"tooling_ref": "bad ref"}, {"tooling_ref": "main\n"}, {"tooling_ref": "release/../main"},
+                       {"tooling_ref": REF, "platforms": "linux/386"},
                        {"tooling_ref": REF, "platforms": "windows/amd64"},
-                       {"tooling_ref": REF, "tooling_repository": "evil repo; rm"}):
+                       {"tooling_ref": REF, "tooling_repository": "evil repo; rm"},
+                       {"tooling_version": "0.2.0; rm -rf /"}):
             with self.subTest(kwargs=kwargs), self.assertRaises(WorkflowError):
                 render_workflow(manifest(), **kwargs)
         with self.assertRaisesRegex(WorkflowError, "native"):
             render_workflow(manifest(runtime="native"), tooling_ref=REF)
+
+
+class ToolingInstallTests(unittest.TestCase):
+    """The install line needs no YAML parser: a released CLI must pin itself from PyPI by default."""
+
+    def install_run(self, **kwargs) -> str:
+        text = render_workflow(manifest(), **kwargs)
+        return next(line for line in text.splitlines() if "pip install" in line).strip()
+
+    def test_the_default_install_pins_the_running_version_from_pypi_not_a_commit(self):
+        run = self.install_run()
+        self.assertEqual(run, f"run: python -m pip install --disable-pip-version-check \"shiplord=={__version__}\"")
+        self.assertNotIn("git+", run)
+        self.assertNotIn("@", run)  # a version requirement, never a git reference or commit
+
+    def test_a_git_reference_is_still_available_for_unreleased_code(self):
+        self.assertIn(f"git+https://github.com/QueryPlanner/shiplord.git@{REF}", self.install_run(tooling_ref=REF))
+        self.assertIn("git+https://github.com/QueryPlanner/shiplord.git@main", self.install_run(tooling_ref="main"))
 
 
 if __name__ == "__main__":

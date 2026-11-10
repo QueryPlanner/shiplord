@@ -14,10 +14,12 @@ You build the app on your computer or in CI. Shiplord deploys a ready Docker ima
 ## Install
 
 ```sh
-python -m pip install git+https://github.com/QueryPlanner/shiplord.git
+python -m pip install shiplord
 shiplord --version
 shiplord doctor --local
 ```
+
+To upgrade, run `python -m pip install --upgrade shiplord`. The GitHub Actions workflow that Shiplord generates installs the same released version.
 
 ## Set up once
 

@@ -1028,7 +1028,8 @@ def registry_status_command(json_output: bool = typer.Option(False, "--json")) -
 @github_app.command("setup", rich_help_panel="Administration")
 def github_setup_command(repo: str = typer.Option(..., "--repo", help="owner/repository"),
                          ci_host: Optional[str] = typer.Option(None, "--ci-host", help="Server name CI should use (default: the alias host)."),
-                         tooling_ref: Optional[str] = typer.Option(None, "--tooling-ref", help="Commit of Shiplord to pin in CI."),
+                         tooling_ref: Optional[str] = typer.Option(None, "--tooling-ref",
+                                                                   help="Commit, branch, or tag of Shiplord to install in CI (default: the running version from PyPI)."),
                          platforms: str = typer.Option("linux/amd64", "--platforms"),
                          tailscale_client_id: Optional[str] = typer.Option(None, "--tailscale-client-id"),
                          tailscale_audience: Optional[str] = typer.Option(None, "--tailscale-audience"),
