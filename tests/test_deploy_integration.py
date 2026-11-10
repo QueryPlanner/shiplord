@@ -444,12 +444,13 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "second")  # the new environment really applies
         (replaced,) = self.containers()
         self.assertNotEqual(replaced, original)
-        self.assertEqual(replaced, self.runtime.container_name(self.registration, before["current"]))
+        self.assertEqual(self.inspect()["Name"].lstrip("/"),
+                         self.runtime.container_name(self.registration, before["current"]))
         after_start = docker("inspect", "--format", "{{.State.StartedAt}}", replaced).stdout.strip()
         self.assertNotEqual(after_start, before_start)
         self.assertEqual(restarted.detail["previous_started_at"], before_start)
         self.assertEqual(restarted.detail["started_at"], after_start)
-        self.assertIs(restarted.detail["probes"]["local_ready"], True)
+        self.assertIs(restarted.detail["probes"]["local_ready"]["ready"], True)
         self.assertIs(restarted.detail["probes"]["route_changed"], False)  # the route was already this release's
 
         after = self.state.read_state()
