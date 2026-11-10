@@ -71,6 +71,7 @@ shiplord plan --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>   # re
 shiplord deploy --image ghcr.io/owner/orders@sha256:<digest> --commit <sha>
 shiplord status
 shiplord logs --tail 100
+shiplord restart
 shiplord rollback
 shiplord recover
 ```
@@ -219,6 +220,7 @@ CI runs `shiplord` in pinned mode: `SHIPLORD_SSH_TARGET`, `SHIPLORD_SSH_IDENTITY
 | `plan [--image I \| --binary B] --commit C` | Local preview, or with an artifact, what the server would do. Changes nothing. |
 | `deploy --image I \| --binary B --commit C` | Deploy a built artifact. `--request-id` makes retries safe. |
 | `status`, `logs --tail N` | Release state, running state, unfinished work; bounded logs. |
+| `restart` | Start the current release again, re-reading its recorded configuration and current environment. No release changes. |
 | `rollback`, `recover` | Restore the previous release; reconcile an interrupted deployment. |
 | `registry login --username U --token-file F \| --token-stdin` / `logout` / `status` | A per-application read-only pull login for private images. There is no `--token` option. |
 | `github setup --repo R` / `check-ci` / `status [--check-server]` / `rotate-key` | CI key, secret and variables, guided Tailscale setup, release workflow; a check-only CI run. |

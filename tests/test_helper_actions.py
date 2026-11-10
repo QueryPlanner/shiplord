@@ -111,19 +111,21 @@ class ReadOnlyActionTests(HelperTestCase):
     def test_capabilities_advertise_every_supported_action_without_touching_the_host(self):
         response, code = self.call("capabilities")
         self.assertEqual((code, response["status"]), (0, "ok"))
-        self.assertEqual(response["actions"], ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"])
+        self.assertEqual(response["actions"], ["capabilities", "plan", "deploy", "status", "logs", "rollback", "recover", "restart", "docker_storage_v1", "docker_shutdown_v1", "docker_generic_v1"])
         self.assertEqual(self.factory_calls, 0)
 
     def test_malformed_arguments_are_rejected_before_any_host_state_is_opened(self):
         bad = [("status", {"unexpected": 1}), ("status", {"job_id": "../x"}) if False else ("logs", {"tail": 0}),
                ("logs", {"tail": 1001}), ("logs", {"tail": "5"}), ("logs", {"tail": True}), ("deploy", {}),
                ("deploy", {"sequence": 1, "artifact": {}}), ("plan", {"bogus": 1}), ("rollback", {"x": 1}),
-               ("recover", {"x": 1})]
+               ("recover", {"x": 1}), ("restart", {"x": 1})]
         for action, arguments in bad:
             with self.subTest(action=action, arguments=arguments), self.assertRaises(ProtocolError):
                 self.call(action, **arguments)
         with self.assertRaises(ProtocolError):
             self.call("rollback", commit="a" * 40)
+        with self.assertRaises(ProtocolError):
+            self.call("restart", commit="a" * 40)
         with self.assertRaises(ProtocolError):
             self.call("deploy", commit="a" * 40, sequence=1, artifact={}, configuration={}, allow_older="yes")
         self.assertEqual(self.factory_calls, 0)
@@ -248,6 +250,38 @@ class DeployJobTests(HelperTestCase):
             response, code = self.call(action, f"{action}-1")
             self.assertEqual((code, response["job"]["action"]), (0, action))
         self.assertEqual([r for _, r in self.launcher.launched], ["rollback-1", "recover-1"])
+
+    def test_restart_without_a_release_is_refused_before_a_job_is_created(self):
+        response, code = self.call("restart", "restart-1")
+        self.assertEqual((code, response["status"], response["outcome"]["detail"]["error"]),
+                         (1, "finished", "no_release"))
+        self.assertEqual(os.listdir(self.layout.jobs / "orders"), [])
+        self.assertEqual(self.launcher.launched, [])
+
+
+class RestartJobTests(HelperTestCase):
+    def test_restart_becomes_a_job_and_the_worker_starts_the_same_release_again(self):
+        self.submit_deploy()
+        self.assertEqual(run_job(self.services, "orders", "req-1"), 0)
+        response, code = self.call("restart", "restart-1")
+        self.assertEqual((code, response["status"], response["job"]["action"]), (0, "accepted", "restart"))
+        self.assertEqual(self.launcher.launched, [("orders", "req-1"), ("orders", "restart-1")])
+        self.assertEqual(run_job(self.services, "orders", "restart-1"), 0)
+        job = self.call("status", job_id="restart-1")[0]["result"]["job"]
+        self.assertEqual((job["outcome"]["status"], job["outcome"]["exit_code"]), ("restarted", 0))
+        self.assertEqual(self.state.read_state()["current"], record())
+        self.assertEqual(self.runtime.names(), ["prepare", "start", "start"])  # no second pull
+        self.assertNotEqual(job["outcome"]["detail"]["previous_started_at"],
+                            job["outcome"]["detail"]["started_at"])
+
+    def test_a_repeated_restart_request_returns_the_recorded_job(self):
+        self.submit_deploy()
+        run_job(self.services, "orders", "req-1")
+        self.call("restart", "restart-1")
+        run_job(self.services, "orders", "restart-1")
+        response, code = self.call("restart", "restart-1")
+        self.assertEqual((code, response["status"], response["job"]["state"]), (0, "accepted", "finished"))
+        self.assertEqual(self.runtime.names(), ["prepare", "start", "start"])
 
 
 class WorkerTests(HelperTestCase):

@@ -405,6 +405,16 @@ class InspectTests(RuntimeTestCase):
         self.docker.results["inspect"] = self.inspect_output()
         self.assertFalse(self.runtime.is_running(REGISTRATION, configured))
 
+    def test_started_at_reads_the_containers_own_start_time(self):
+        self.docker.results["inspect"] = CommandResult(1, "No such object")
+        self.assertIsNone(self.runtime.started_at(REGISTRATION, release()))
+        for output, expected in (("2026-11-10T12:00:00.123456789Z\n", "2026-11-10T12:00:00.123456789Z"),
+                                 ("\n", None), ("0001-01-01T00:00:00Z\n", None)):
+            self.docker.results["inspect"] = CommandResult(0, output)
+            self.assertEqual(self.runtime.started_at(REGISTRATION, release()), expected, output)
+        self.assertEqual(self.docker.calls[-1][2:4], ["--format", "{{.State.StartedAt}}"])
+        self.assertEqual(self.docker.calls[-1][-1], DockerRuntime.container_name(REGISTRATION, release()))
+
     def test_logs_are_bounded_and_empty_without_a_container(self):
         self.assertEqual(self.runtime.logs(REGISTRATION, 50), "")
         self.docker.results["ps"] = CommandResult(0, ID_A + "\n")

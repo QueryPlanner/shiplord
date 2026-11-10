@@ -499,5 +499,111 @@ class RollbackAndStatusTests(DeployTestCase):
         self.assertEqual(self.deployer.status()["unfinished_transaction"], {"request_id": "req-3", "phase": "prepared"})
 
 
+class RestartTests(DeployTestCase):
+    def restart(self, request_id="rs-1"):
+        return self.run_locked(self.deployer.restart, request_id)
+
+    def test_restart_starts_the_current_release_again_and_reports_both_start_times(self):
+        self.deploy()
+        before = self.state.read_state()
+        previous_start = self.runtime.start_times[release_id(record())]
+        outcome = self.restart()
+        self.assertEqual((outcome.status, outcome.exit_code, outcome.ok), ("restarted", 0, True))
+        self.assertEqual(outcome.detail["release"], identity(before["current"]))
+        self.assertEqual(outcome.detail["previous_started_at"], previous_start)
+        self.assertNotEqual(outcome.detail["started_at"], previous_start)
+        self.assertEqual(outcome.detail["started_at"], self.runtime.start_times[release_id(record())])
+        self.assertEqual(self.runtime.names(), ["prepare", "start", "start"])  # no second pull or prepare
+        self.assertEqual(self.runtime.discarded, [])
+        after = self.state.read_state()
+        self.assertEqual((after["current"], after["previous"], after["generation"]),
+                         (before["current"], before["previous"], before["generation"]))
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(self.progress[-4:], ["runtime-changing", "runtime-ready", "routing-changing", "routing-ready"])
+
+    def test_restart_keeps_the_rollback_target(self):
+        self.deploy()
+        self.deploy(request_id="req-2", commit="c", image="d", sequence=1001)
+        before = self.state.read_state()
+        self.assertEqual(self.restart().status, "restarted")
+        after = self.state.read_state()
+        self.assertEqual((after["current"]["commit"], after["previous"]["commit"]), ("c" * 40, "a" * 40))
+        self.assertEqual(after["generation"], before["generation"])
+
+    def test_restart_uses_the_stored_release_not_any_local_request(self):
+        self.deploy()
+        stored = self.state.read_state()["current"]
+        started = []
+        original = self.runtime.start
+
+        def capture(registration, release):
+            started.append(release)
+            return original(registration, release)
+        self.runtime.start = capture
+        self.restart()
+        self.assertEqual(started, [stored])  # exactly the recorded configuration and artifact
+
+    def test_restart_without_a_release_is_refused_and_changes_nothing(self):
+        outcome = self.restart()
+        self.assertEqual((outcome.status, outcome.exit_code, outcome.detail["error"]), ("failed", 1, "no_release"))
+        self.assertEqual(self.runtime.calls, [])
+        self.assertEqual(self.state.read_state()["generation"], 0)
+        self.assertIsNone(self.state.read_journal())
+
+    def test_restart_while_a_transaction_is_unfinished_requires_recovery(self):
+        self.deploy()
+        with self.lock.acquire():
+            self.state.begin("req-5", record(commit="c", image="d", sequence=1001))
+        outcome = self.restart()
+        self.assertEqual((outcome.status, outcome.detail["error"]), ("failed", "recovery_required"))
+        self.assertEqual(self.runtime.names(), ["prepare", "start"])  # the restart did not run
+        self.assertIsNotNone(self.state.read_journal())
+
+    def test_a_reused_restart_request_id_is_rejected(self):
+        self.deploy()
+        self.assertEqual(self.restart("rs-1").status, "restarted")
+        outcome = self.restart("rs-1")
+        self.assertEqual((outcome.status, outcome.detail["error"], outcome.exit_code),
+                         ("rejected", "request_id_reused", 2))
+
+    def test_a_failed_restart_restores_the_same_release_and_reports_a_failure(self):
+        self.deploy()
+        before = self.state.read_state()
+        original = self.runtime.start
+        attempts = []
+
+        def fail_once(registration, release):
+            attempts.append(release_id(release))
+            if len(attempts) == 1:
+                self.runtime.running = set()  # a failed start leaves no container behind, as Docker does
+                raise RuntimeFailure("could not start", "start")
+            return original(registration, release)
+        self.runtime.start = fail_once
+        outcome = self.restart()
+        self.assertEqual((outcome.status, outcome.exit_code), ("failed", 1))
+        self.assertEqual(outcome.detail["error"], "restart_failed")
+        self.assertEqual(outcome.detail["restored_release"], identity(before["current"]))
+        self.assertNotIn("started_at", outcome.detail)
+        self.assertEqual(len(attempts), 2)  # the restart, then the verified restoration
+        self.assertEqual(self.state.read_state()["current"], before["current"])
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(self.runtime.running, {release_id(before["current"])})
+
+    def test_restart_refuses_an_unusable_legacy_volume_before_any_side_effect(self):
+        self.deploy()
+        self.progress.clear()
+
+        def refuse(registration, *, create, provenance=None):
+            raise RuntimeFailure("the unlabelled application volume has no retained Shiplord container evidence",
+                                 "storage")
+        self.runtime.check_volume = refuse
+        outcome = self.restart()
+        self.assertEqual((outcome.status, outcome.detail["error"]), ("failed", "prepare_failed"))
+        self.assertEqual(outcome.detail["restored"], True)
+        self.assertNotIn("runtime-changing", self.progress)
+        self.assertIsNone(self.state.read_journal())
+        self.assertEqual(self.state.read_state()["generation"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,7 @@ application is denied (`{"status": "error", "error": "access_denied"}`, exit 3).
 | `logs` | null | `tail` 1–1000 | `result.logs` (bounded) |
 | `plan` | required | `sequence`, `artifact`, `configuration`, `allow_older` | `result`: what a deploy would do; read-only |
 | `deploy` | required | `sequence`, `artifact`, `configuration`, `allow_older` | `accepted` with a job, or `finished` with an outcome |
+| `restart` | null | none | `accepted` with a job, or `finished` with an outcome |
 | `rollback` | null | none | `accepted` with a job |
 | `recover` | null | none | `accepted` with a job |
 
@@ -59,6 +60,14 @@ requested optional features in one capabilities call before submitting `plan` or
 `shutdown: {outgoing_policy, candidate_policy, note}`, and a finished deploy may include `shutdown` stage reports
 (`stop_requested`, `signalled`, `waiting`, `exited`, `forced`, `deadline_expired`).
 
+`restart` is listed in `actions` by a helper that supports it. The client requires that entry before submitting a
+restart; an older helper reports an incompatible action (exit 4, re-run `shiplord server bootstrap`). A restart
+reuses the deploy transaction journal but pulls nothing and records no new commit, so `current`, `previous`, and
+the generation stay as they were. Its outcome is `restarted` with `previous_started_at` and `started_at` (the
+runtime's own start time, or null when the runtime cannot report one), and `probes` with `local_ready`,
+`route_changed`, and `proxy_routing`. A restart that fails and restores the same release is `failed` with
+`error: "restart_failed"` and `restored_release`.
+
 Arguments are validated before any host state is opened. `artifact` is `{"kind": "docker", "image":
 "registry/name@sha256:<64 hex>"}` (the repository must equal the registered one) or `{"kind": "native", "sha256",
 "size", "architecture"}`. `configuration` is a complete `ship.toml` as JSON; its hostname must equal the registered
@@ -66,7 +75,7 @@ one. `sequence` is the release ordering key (the commit's committer timestamp).
 
 ### Jobs
 
-`deploy`, `rollback`, and `recover` create a job record keyed by `request_id` and start a worker as a transient
+`deploy`, `restart`, `rollback`, and `recover` create a job record keyed by `request_id` and start a worker as a transient
 systemd unit, so the operation survives the SSH session. A repeated `request_id` returns the recorded job whatever
 its outcome was; changed content under the same ID is refused. The response is:
 
@@ -76,12 +85,12 @@ its outcome was; changed content under the same ID is refused. The response is:
 ```
 
 Poll `status` with `job_id` until `state` is `finished` (then `outcome` is set) or `interrupted` (the worker
-vanished; run `recover`). A `deploy` refused by the immediate checks returns `{"status": "finished", "outcome":
-…}` without creating a job. An outcome is `{"status", "exit_code", "detail"}`:
+vanished; run `recover`). A `deploy` or `restart` refused by the immediate checks returns `{"status": "finished",
+"outcome": …}` without creating a job. An outcome is `{"status", "exit_code", "detail"}`:
 
 | `status` | `exit_code` |
 | --- | --- |
-| `succeeded`, `unchanged`, `already_applied`, `recovered`, `nothing_to_recover` | 0 |
+| `succeeded`, `unchanged`, `already_applied`, `recovered`, `nothing_to_recover`, `restarted` | 0 |
 | `failed`, `stale_release` (error in `detail`) | 1 |
 | `rejected` | 2 |
 | `rolled_back` | 5 |

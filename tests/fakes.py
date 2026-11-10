@@ -40,6 +40,8 @@ class FakeRuntime:
         self.prepare_error = None
         self.start_errors: dict[str, Exception] = {}
         self.discarded: list[str] = []
+        self.start_times: dict[str, str] = {}
+        self.start_count = 0
 
     def prepare(self, registration, release):
         self.calls.append(("prepare", release_id(release)))
@@ -57,6 +59,8 @@ class FakeRuntime:
                 raise error
             raise error
         self.running = {rid}
+        self.start_count += 1
+        self.start_times[rid] = f"start-{self.start_count}"
 
     def stop(self, registration):
         self.calls.append(("stop",))
@@ -64,6 +68,10 @@ class FakeRuntime:
 
     def is_running(self, registration, release):
         return release_id(release) in self.running
+
+    def started_at(self, registration, release):
+        rid = release_id(release)
+        return self.start_times.get(rid) if rid in self.running else None
 
     def logs(self, registration, tail):
         return ""

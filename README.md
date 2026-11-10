@@ -68,9 +68,14 @@ If the new version fails its health check, Shiplord restores the last working ve
 ```sh
 shiplord status
 shiplord logs --tail 100
+shiplord restart
 shiplord rollback
 shiplord recover
 ```
+
+`shiplord restart` starts the current release again so its recorded configuration and the environment as it is now
+apply. It changes nothing about the release itself: no image is pulled, no commit is recorded, and the current and
+previous releases stay the same.
 
 Use `shiplord env set --from-file .env.production` to set app secrets. Shiplord does not print or log secret values.
 

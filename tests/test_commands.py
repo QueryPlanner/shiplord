@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -224,6 +225,33 @@ class DeployCommandTests(ClientTestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(CommandError):
                 self.deploy(**kwargs)
         self.assertEqual(self.commands, [])
+
+    def restart(self, request_id="rs-1"):
+        import shiplord.client as client_module
+        original = client_module.wait_for_job
+        run = lambda *a, **k: (run_job(self.services, "orders", request_id),  # noqa: E731
+                               original(*a, **dict(k, interval=0, sleep=lambda s: None)))[1]
+        client_module.wait_for_job = run
+        self.addCleanup(setattr, client_module, "wait_for_job", original)
+        return commands.restart_application(manifest(), self.client, request_id=request_id)
+
+    def test_restart_reports_both_start_times_and_leaves_the_release_alone(self):
+        self.deploy()
+        before = self.state.read_state()
+        code, result = self.restart()
+        self.assertEqual((code, result["ok"], result["status"]), (0, True, "restarted"))
+        self.assertEqual(result["release"]["commit"], COMMIT)
+        self.assertNotEqual(result["previous_started_at"], result["started_at"])
+        after = self.state.read_state()
+        self.assertEqual((after["current"], after["previous"], after["generation"]),
+                         (before["current"], before["previous"], before["generation"]))
+
+    def test_restart_is_refused_when_the_helper_does_not_advertise_it(self):
+        with patch.object(self.client, "call", return_value={"status": "ok", "actions": ["capabilities", "deploy"]}):
+            with self.assertRaises(CommandError) as caught:
+                commands.restart_application(manifest(), self.client)
+        self.assertEqual(caught.exception.code, 4)
+        self.assertIn("bootstrap", str(caught.exception))
 
 
 class QueryCommandTests(ClientTestCase):

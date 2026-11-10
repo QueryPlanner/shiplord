@@ -25,7 +25,7 @@ KEEP_JOBS = 25
 MAX_RUNTIME_SECONDS = 3600  # a job that has not finished by then is stopped, releasing the host lock
 MAX_PENDING_JOBS = 4  # unfinished jobs per application; further submissions are refused
 _ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}\Z")
-ACTIONS = ("deploy", "rollback", "recover")
+ACTIONS = ("deploy", "rollback", "recover", "restart")
 TERMINAL = ("finished",)
 
 

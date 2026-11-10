@@ -22,7 +22,7 @@ from .shutdown import ShutdownError, check_budget, check_recovery_budget, policy
 from .storage import container_path
 
 MAX_FUTURE_SECONDS = 24 * 3600  # clock skew allowance; a far-future sequence would otherwise freeze the application
-SUCCESS = {"succeeded", "unchanged", "already_applied", "recovered", "nothing_to_recover"}
+SUCCESS = {"succeeded", "unchanged", "already_applied", "recovered", "nothing_to_recover", "restarted"}
 
 
 @dataclass(frozen=True)
@@ -105,6 +105,27 @@ class Deployer:
             return Outcome("rejected", 2, {"error": "request_id_reused"})
         return None
 
+    def _restart_gate(self, request_id: str | None) -> Outcome | None:
+        """Refuse work while a transaction is unfinished; a restart never reuses a recorded request ID."""
+        if self.state.read_journal() is not None:
+            return Outcome("failed", 1, {"error": "recovery_required",
+                                         "message": "an unfinished transaction exists; run recover first"})
+        if request_id in self.state.read_state()["seen_requests"]:
+            return Outcome("rejected", 2, {"error": "request_id_reused"})
+        return None
+
+    def _restart_provenance(self, current: dict) -> dict | None:
+        """Read-only proof for a legacy volume; the retained container is still there before the restart."""
+        if current["artifact"]["kind"] != "docker":
+            return None
+        check_volume = getattr(self.runtime, "check_volume", None)
+        return None if check_volume is None else check_volume(self.registration, create=False)
+
+    def _started_at(self, release: dict) -> str | None:
+        """The runtime's own start time for a release, when the runtime can report one."""
+        started_at = getattr(self.runtime, "started_at", None)
+        return None if started_at is None else started_at(self.registration, release)
+
     # operations ---------------------------------------------------------------
     def deploy(self, request: dict) -> Outcome:
         request_id = request.get("request_id")
@@ -175,6 +196,42 @@ class Deployer:
                                              "when it is later replaced"}}
         return {"action": "deploy", "restarts_application": current is not None, **storage, **shutdown,
                 "route_change": {"absent": "create", "different": "replace", "identical": "none"}[route], **base}
+
+    def restart_preflight(self, request_id: str | None) -> Outcome | None:
+        """Cheap synchronous checks before a restart job is created; None means the request may proceed."""
+        try:
+            refusal = self._restart_gate(request_id)
+            if refusal:
+                return refusal
+            if self.state.read_state()["current"] is None:
+                return Outcome("failed", 1, {"error": "no_release",
+                                             "message": "no release has been deployed for this application"})
+            return None
+        except StateError as error:
+            return Outcome("failed", 1, {"error": "state_unreadable", "message": str(error)})
+
+    def restart(self, request_id: str) -> Outcome:
+        """Start the current release again so its recorded configuration and current environment apply.
+
+        Nothing about the release changes: no image is pulled, no new commit is recorded, and the committed
+        release, its previous release, and the generation stay exactly as they were.
+        """
+        refusal = self.restart_preflight(request_id)
+        if refusal is not None:
+            return refusal
+        try:
+            committed = self.state.read_state()
+        except StateError as error:
+            return Outcome("failed", 1, {"error": "state_unreadable", "message": str(error)})
+        current = committed["current"]
+        if current is None:  # the preflight refused already; the state may have changed since
+            return Outcome("failed", 1, {"error": "no_release",
+                                         "message": "no release has been deployed for this application"})
+        try:
+            provenance = self._restart_provenance(current)
+        except RuntimeFailure as failure:  # nothing has changed yet
+            return Outcome("failed", 1, {"error": "prepare_failed", "restored": True, **self._describe(failure)})
+        return self._restart_transaction(request_id, current, committed, provenance)
 
     def rollback(self, request_id: str) -> Outcome:
         try:
@@ -272,6 +329,50 @@ class Deployer:
         warnings = self._retire(before, candidate)
         return Outcome("succeeded", 0, {"release": identity(candidate), "previous": identity(before["current"]),
                                         "image": prepared, "probes": probes, "warnings": warnings, **self._shutdown_report()})
+
+    def _restart_transaction(self, request_id: str, current: dict, before: dict,
+                             provenance: dict | None) -> Outcome:
+        """Replace the running release with itself: the journal makes an interrupted restart recoverable."""
+        previous_start = self._started_at(current)
+        try:
+            self.state.begin(request_id, current, storage_provenance=provenance)
+        except StateError as error:
+            return Outcome("failed", 1, {"error": "journal_unavailable", "message": str(error)})
+        probes: dict = {}
+        try:
+            self._advance("runtime-changing")
+            self._start_runtime(current, provenance, state=self.state)
+            probes["local_ready"] = self.probes.wait_ready(
+                self.registration, current, alive=lambda: self.runtime.is_running(self.registration, current))
+            self._advance("runtime-ready")
+            self._advance("routing-changing")
+            routed = self.routes.apply(self.registration)
+            probes["route_changed"] = routed.changed
+            probes["proxy_routing"] = self.probes.routing(self.registration)
+            if probes["proxy_routing"] is None:
+                probes["warning"] = ("Caddy's admin API could not be read, so the active routing was not verified; "
+                                     "run `shiplord doctor --server <alias> --deep`")
+            if probes["proxy_routing"] is False:
+                raise _StepFailure("the active Caddy configuration does not route this hostname to the application",
+                                   "routing")
+            self._advance("routing-ready")
+        except (RuntimeFailure, ProbeFailure, RoutingError, _StepFailure, StateError) as failure:
+            if isinstance(failure, RuntimeFailure) and failure.intervention_required:
+                # The outgoing process was signalled and may still be draining: restoring would restart or remove it.
+                return self._intervention(failure, probes)
+            outcome = self._restore(failure, probes, current, before)
+            if outcome.status == "rolled_back":  # the same release was restored, so the restart itself failed
+                return Outcome("failed", 1, {**outcome.detail, "error": "restart_failed"})
+            return outcome
+        try:
+            # No record_commit: restarting does not change the current release, its previous release, or the generation.
+            self.state.clear_after_reconciliation()
+        except StateError as error:
+            return Outcome("intervention_required", 6, {"error": "commit_unconfirmed", "message": str(error),
+                                                       "release": identity(current)})
+        return Outcome("restarted", 0, {"release": identity(current), "previous_started_at": previous_start,
+                                        "started_at": self._started_at(current), "probes": probes,
+                                        **self._shutdown_report()})
 
     def _validate_budget(self, candidate: dict, outgoing: dict | None) -> None:
         if candidate["artifact"]["kind"] != "docker":

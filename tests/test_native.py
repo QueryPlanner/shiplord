@@ -327,6 +327,17 @@ class InspectTests(RuntimeTestCase):
         self.assertFalse(self.runtime.is_running(REGISTRATION, self.release))
         self.assertEqual(self.system.calls, [])
 
+    def test_started_at_reads_the_units_own_start_time(self):
+        for output, expected in (("ActiveEnterTimestamp=Tue 2026-11-10 12:00:00 UTC\n",
+                                  "Tue 2026-11-10 12:00:00 UTC"),
+                                 ("ActiveEnterTimestamp=n/a\n", None), ("ActiveEnterTimestamp=\n", None), ("", None)):
+            self.system.results["show"] = CommandResult(0, output)
+            self.assertEqual(self.runtime.started_at(REGISTRATION, self.release), expected, output)
+        self.assertEqual(self.system.calls[-1],
+                         [SYSTEMCTL, "show", "--property=ActiveEnterTimestamp", "shiplord-orders.service"])
+        self.system.results["show"] = CommandResult(1, "Unit shiplord-orders.service not loaded.")
+        self.assertIsNone(self.runtime.started_at(REGISTRATION, self.release))
+
     def test_logs_come_from_the_journal_bounded_and_empty_on_failure(self):
         self.system.results[JOURNALCTL] = CommandResult(0, "line\n")
         self.assertEqual(self.runtime.logs(REGISTRATION, 10**9), "line\n")

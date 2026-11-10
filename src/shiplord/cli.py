@@ -648,6 +648,27 @@ def _render_operation(code: int, result: dict, target: str, operation: str) -> N
         typer.echo("Next: run `shiplord recover` from this application's repository to reconcile it.")
 
 
+def _render_restart(code: int, result: dict, target: str) -> None:
+    typer.echo(f"Target: {target}")
+    typer.echo(f"Outcome: {(result.get('status') or 'failed').replace('_', ' ')}")
+    release = result.get("release")
+    if isinstance(release, dict):
+        typer.echo(f"Release: {_short_release(release)}")
+    if code == 0:
+        typer.echo(f"Previous start: {result.get('previous_started_at') or 'not running'}")
+        typer.echo(f"New start: {result.get('started_at') or 'unknown'}")
+    restored = result.get("restored_release")
+    if isinstance(restored, dict):
+        typer.echo(f"Restored release: {_short_release(restored)}")
+    for name in ("error", "message"):
+        if result.get(name) is not None:
+            typer.echo(f"{name.capitalize()}: {result[name]}")
+    for warning in result.get("warnings") or []:
+        typer.echo(f"Warning: {warning}")
+    if result.get("error") == "recovery_required":
+        typer.echo("Next: run `shiplord recover` from this application's repository to reconcile it.")
+
+
 def _doctor_value(value: object) -> str:
     if isinstance(value, dict):
         if "ok" in value:
@@ -858,6 +879,14 @@ def deploy(image: Optional[str] = typer.Option(None, "--image", help="Immutable 
             verify_public=verify_public, require_public=require_public)
     _execute(action, json_output, lambda code, result: _render_operation(
         code, result, f"{manifest['name']} on {manifest['server']}", "deployment"))
+
+
+@app.command(rich_help_panel="Quick start")
+def restart(json_output: bool = typer.Option(False, "--json")) -> None:
+    """Start the current release again so a changed environment or configuration takes effect."""
+    manifest = _manifest(json_output)
+    _execute(lambda: commands.restart_application(manifest, _helper(manifest), on_progress=_progress(json_output)),
+             json_output, lambda code, result: _render_restart(code, result, f"{manifest['name']} on {manifest['server']}"))
 
 
 @app.command(rich_help_panel="Quick start")
@@ -1088,7 +1117,7 @@ def github_rotate_key(json_output: bool = typer.Option(False, "--json")) -> None
 
 def _order_help() -> None:
     panel_order = {"Quick start": 0, "Setup": 1, "Troubleshooting": 2, "Administration": 3}
-    quick_order = {name: index for index, name in enumerate(("apps", "status", "logs", "plan", "deploy"))}
+    quick_order = {name: index for index, name in enumerate(("apps", "status", "logs", "plan", "deploy", "restart"))}
     app.registered_commands.sort(key=lambda info: (
         panel_order.get(info.rich_help_panel, 4),
         quick_order.get(info.name or info.callback.__name__, 99),

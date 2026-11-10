@@ -110,7 +110,8 @@ def set_environment(manifest: dict, admin: AdminClient, operation: str, text: st
             raise CommandError("the file defines no variables; use `shiplord env clear` to remove the environment")
         arguments["text"] = text
     result = admin.call("environment", manifest["name"], arguments)
-    note = "Takes effect the next time a release starts." if operation in ("set", "clear") else None
+    note = "Takes effect the next time a release starts, or immediately with `shiplord restart`." \
+        if operation in ("set", "clear") else None
     return 0, {"ok": True, **result, **({"note": note} if note else {})}
 
 
@@ -309,6 +310,15 @@ def run_job_command(manifest: dict, client: HelperClient, action: str, *, reques
                               on_progress=on_progress)
     return outcome["exit_code"], {"ok": outcome["exit_code"] == 0, "request_id": request_id, "status": outcome["status"],
                                   "exit_code": outcome["exit_code"], **outcome["detail"]}
+
+
+def restart_application(manifest: dict, client: HelperClient, *, request_id: str | None = None,
+                        on_progress: Callable[[str], None] = lambda phase: None) -> tuple[int, dict]:
+    """Start the current release again so a changed environment or recorded configuration applies."""
+    if "restart" not in client.call("capabilities")["actions"]:
+        raise CommandError("the server helper does not support restart; re-run `shiplord server bootstrap` to upgrade "
+                           "it, then retry", 4)
+    return run_job_command(manifest, client, "restart", request_id=request_id, on_progress=on_progress)
 
 
 def application_doctor(manifest: dict, client: HelperClient, *, which=None, resolve=None) -> tuple[int, dict]:

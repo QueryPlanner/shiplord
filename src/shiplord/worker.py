@@ -36,6 +36,8 @@ def run_job(services: HostServices, application_id: str, request_id: str) -> int
                     result = deployer.deploy({**record["request"], "request_id": request_id})
                 elif record["action"] == "rollback":
                     result = deployer.rollback(request_id)
+                elif record["action"] == "restart":
+                    result = deployer.restart(request_id)
                 else:
                     result = deployer.recover()
                 outcome = _outcome(result.status, result.exit_code, result.detail)

@@ -81,6 +81,7 @@ class Runtime(Protocol):
     def start(self, registration: dict, release: dict) -> None: ...
     def stop(self, registration: dict) -> None: ...
     def is_running(self, registration: dict, release: dict) -> bool: ...
+    def started_at(self, registration: dict, release: dict) -> str | None: ...
     def logs(self, registration: dict, tail: int) -> str: ...
     def discard(self, registration: dict, release: dict) -> list[str]: ...
 
@@ -505,6 +506,15 @@ class DockerRuntime:
                 and actual_policy == policy(release["configuration"])
                 and template == release["configuration"]["template"]
                 and mount_list.split().count(expected) == 1)
+
+    def started_at(self, registration: dict, release: dict) -> str | None:
+        """The container's own start time, as Docker records it; None when it is not there."""
+        result = self._docker(["inspect", "--format", "{{.State.StartedAt}}",
+                               self.container_name(registration, release)], "inspect")
+        if result.code != 0:
+            return None
+        started = result.output.strip()
+        return None if started in ("", "0001-01-01T00:00:00Z") else started
 
     def logs(self, registration: dict, tail: int) -> str:
         tail = max(1, min(int(tail), MAX_LOG_LINES))

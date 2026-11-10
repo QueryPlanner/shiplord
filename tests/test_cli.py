@@ -134,8 +134,8 @@ class CLITests(unittest.TestCase):
 
     def test_commands_that_need_a_manifest_fail_cleanly_without_one_and_write_nothing(self):
         commands = [["provision", "--json"], ["status", "--json"], ["logs", "--tail", "10"], ["rollback", "--json"],
-                    ["recover", "--json"], ["plan", "--json"], ["env", "keys", "--json"], ["doctor", "--json"],
-                    ["deploy", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--json"]]
+                    ["recover", "--json"], ["restart", "--json"], ["plan", "--json"], ["env", "keys", "--json"],
+                    ["doctor", "--json"], ["deploy", "--image", "ghcr.io/example/orders@sha256:" + "a" * 64, "--json"]]
         with tempfile.TemporaryDirectory() as directory:
             for command in commands:
                 with self.subTest(command=command):
@@ -169,7 +169,7 @@ class CLITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as config:
             (Path(directory) / "ship.toml").write_text(MANIFEST)
             env = dict(os.environ, XDG_CONFIG_HOME=config)
-            for command in (["status", "--json"], ["provision", "--json"], ["rollback", "--json"]):
+            for command in (["status", "--json"], ["provision", "--json"], ["rollback", "--json"], ["restart", "--json"]):
                 with self.subTest(command=command):
                     self.assertEqual(self.invoke(directory, *command, env=env).returncode, 3)
             self.assertEqual(self.invoke(directory, "server", "bootstrap", "production", env=env).returncode, 3)

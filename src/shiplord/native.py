@@ -234,6 +234,15 @@ class NativeRuntime:
         state = dict(line.split("=", 1) for line in result.output.splitlines() if "=" in line)
         return result.code == 0 and state.get("ActiveState") == "active" and state.get("SubState") == "running"
 
+    def started_at(self, registration: dict, release: dict) -> str | None:
+        """The unit's own start time, as systemd records it; None when it is not there."""
+        result = self._systemctl(["show", "--property=ActiveEnterTimestamp", self.unit_name(registration)], "inspect")
+        if result.code != 0:
+            return None
+        _, _, started = result.output.strip().partition("=")
+        started = started.strip()
+        return None if started in ("", "n/a") else started
+
     def logs(self, registration: dict, tail: int) -> str:
         tail = max(1, min(int(tail), MAX_LOG_LINES))
         try:

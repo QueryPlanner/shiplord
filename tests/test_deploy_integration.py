@@ -416,6 +416,47 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertEqual(json.loads(self.get("/sqlite")), ["v1", "v1", "v1"])
         self.assertNotIn("storage", self.state.read_state()["current"]["configuration"])
 
+    def test_restart_applies_a_changed_environment_without_changing_the_release(self):
+        """A restart starts the same release again, re-reading the environment; no release record moves."""
+        self.fresh_container_slate()
+        environment = self.layout.environments / self.app / "app.env"
+
+        def write_environment(token):
+            environment.write_text(f"DATA_DIR=/app/src/.adk\nCUSTOM_TOKEN={token}\n")
+            environment.chmod(0o600)
+
+        write_environment("first")
+        self.assertOutcome(self.deploy("req-r1", "v1", 6000), "succeeded")
+        self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "first")
+        (original,) = self.containers()
+        before = self.state.read_state()
+        before_start = docker("inspect", "--format", "{{.State.StartedAt}}", original).stdout.strip()
+
+        write_environment("second")
+        with self.lock.acquire():
+            restarted = self.deployer.restart("req-r2")
+        self.assertOutcome(restarted, "restarted")
+        self.assertEqual(restarted.exit_code, 0)
+
+        self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "second")  # the new environment really applies
+        (replaced,) = self.containers()
+        self.assertNotEqual(replaced, original)
+        self.assertEqual(replaced, self.runtime.container_name(self.registration, before["current"]))
+        after_start = docker("inspect", "--format", "{{.State.StartedAt}}", replaced).stdout.strip()
+        self.assertNotEqual(after_start, before_start)
+        self.assertEqual(restarted.detail["previous_started_at"], before_start)
+        self.assertEqual(restarted.detail["started_at"], after_start)
+        self.assertIs(restarted.detail["probes"]["local_ready"], True)
+        self.assertIs(restarted.detail["probes"]["route_changed"], False)  # the route was already this release's
+
+        after = self.state.read_state()
+        self.assertEqual(after["current"], before["current"])  # the restart changed no release record
+        self.assertEqual(after["previous"], before["previous"])
+        self.assertEqual(after["generation"], before["generation"])
+        self.assertEqual(after["seen_requests"], [*before["seen_requests"], "req-r2"])
+        self.assertIsNone(self.state.read_journal())
+        self.assertTrue(self.runtime.is_running(self.registration, after["current"]))
+
     def policy_configuration(self, timeout, action):
         value = self.configuration()
         value["deploy"].update(shutdown_timeout_seconds=timeout, shutdown_timeout_action=action)
