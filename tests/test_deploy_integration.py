@@ -416,8 +416,11 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertEqual(json.loads(self.get("/sqlite")), ["v1", "v1", "v1"])
         self.assertNotIn("storage", self.state.read_state()["current"]["configuration"])
 
-    def test_restart_applies_a_changed_environment_without_changing_the_release(self):
-        """A restart starts the same release again, re-reading the environment; no release record moves."""
+    def test_zzzz_restart_applies_a_changed_environment_without_changing_the_release(self):
+        """A restart starts the same release again, re-reading the environment; no release record moves.
+
+        Runs last because this class shares one application's state; its sequence is above every other test's.
+        """
         self.fresh_container_slate()
         environment = self.layout.environments / self.app / "app.env"
 
@@ -426,7 +429,7 @@ class RealDockerDeployTests(unittest.TestCase):
             environment.chmod(0o600)
 
         write_environment("first")
-        self.assertOutcome(self.deploy("req-r1", "v1", 6000), "succeeded")
+        self.assertOutcome(self.deploy("req-restart1", "v1", 8300), "succeeded")
         self.assertEqual(json.loads(self.get("/env"))["CUSTOM_TOKEN"], "first")
         (original,) = self.containers()
         before = self.state.read_state()
@@ -434,7 +437,7 @@ class RealDockerDeployTests(unittest.TestCase):
 
         write_environment("second")
         with self.lock.acquire():
-            restarted = self.deployer.restart("req-r2")
+            restarted = self.deployer.restart("req-restart2")
         self.assertOutcome(restarted, "restarted")
         self.assertEqual(restarted.exit_code, 0)
 
@@ -453,7 +456,7 @@ class RealDockerDeployTests(unittest.TestCase):
         self.assertEqual(after["current"], before["current"])  # the restart changed no release record
         self.assertEqual(after["previous"], before["previous"])
         self.assertEqual(after["generation"], before["generation"])
-        self.assertEqual(after["seen_requests"], [*before["seen_requests"], "req-r2"])
+        self.assertEqual(after["seen_requests"], [*before["seen_requests"], "req-restart2"])
         self.assertIsNone(self.state.read_journal())
         self.assertTrue(self.runtime.is_running(self.registration, after["current"]))
 
