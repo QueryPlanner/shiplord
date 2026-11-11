@@ -187,7 +187,7 @@ class WorkflowTests(unittest.TestCase):
         action = steps[-1]
         self.assertEqual((action["name"], action["uses"]),
                          ("Deploy with Shiplord", f"QueryPlanner/shiplord/deploy@{REF}"))
-        self.assertIn(f"uses: QueryPlanner/shiplord/deploy@{REF} # v1", self.deploy_text)
+        self.assertIn(f"uses: QueryPlanner/shiplord/deploy@{REF}", self.deploy_text)
         self.assertEqual(action["with"], {
             "check-only": "${{ inputs.check_only }}",
             "ssh-private-key": "${{ secrets.SHIPLORD_SSH_PRIVATE_KEY }}",
@@ -236,16 +236,19 @@ class WorkflowTests(unittest.TestCase):
         for branch in ("main", "release/prod"):
             value = manifest(github={"repository": "Example/orders", "deployment_branch": branch})
             for quality in (None, DEFAULT_QUALITY_WORKFLOW):
-                for text in (render_workflow(value, tooling_ref=REF, quality_workflow=quality),
-                             render_deploy_workflow(value, tooling_ref=REF)):
-                    with self.subTest(branch=branch, quality=quality, text=text.splitlines()[0]):
-                        result = subprocess.run(["actionlint", "-shellcheck=", "-pyflakes=", "-"],
-                                                input=text, capture_output=True, text=True, timeout=30)
-                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        native = render_workflow(native_manifest(), tooling_ref=REF)
-        result = subprocess.run(["actionlint", "-shellcheck=", "-pyflakes=", "-"], input=native,
-                                capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                for pin in ({"tooling_ref": REF}, {"tooling_version": "0.2.0"}):
+                    for text in (render_workflow(value, **pin, quality_workflow=quality),
+                                 render_deploy_workflow(value, **pin)):
+                        with self.subTest(branch=branch, quality=quality, pin=pin, text=text.splitlines()[0]):
+                            result = subprocess.run(["actionlint", "-shellcheck=", "-pyflakes=", "-"],
+                                                    input=text, capture_output=True, text=True, timeout=30)
+                            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for pin in ({"tooling_ref": REF}, {"tooling_version": "0.2.0"}):
+            native = render_workflow(native_manifest(), **pin)
+            with self.subTest(pin=pin):
+                result = subprocess.run(["actionlint", "-shellcheck=", "-pyflakes=", "-"], input=native,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     @unittest.skipUnless(shutil.which("actionlint"), "actionlint is required to validate Actions expressions")
     def test_an_upgraded_workflow_is_still_valid_yaml_and_passes_actionlint(self):
@@ -346,6 +349,18 @@ class WorkflowTests(unittest.TestCase):
     def test_the_tooling_is_installed_from_the_pinned_commit(self):
         install = next(s for s in self.steps("deploy", self.deploy_jobs) if s.get("name") == "Install the pinned Shiplord")
         self.assertIn(f"git+https://github.com/QueryPlanner/shiplord.git@{REF}", install["run"])
+
+    def test_the_installed_version_can_pin_the_deploy_workflow(self):
+        data = parse(render_deploy_workflow(manifest(), tooling_version="0.2.0"))
+        install = next(s for s in data["jobs"]["deploy"]["steps"] if s.get("name") == "Install the pinned Shiplord")
+        self.assertIn("shiplord==0.2.0", install["run"])
+        self.assertEqual(data["jobs"]["deploy"]["steps"][-1]["uses"],
+                         "QueryPlanner/shiplord/deploy@465a02fd0d76308546893d2cc37a94254e07c598")
+        self.assertNotIn("@None", render_deploy_workflow(manifest(), tooling_version="0.2.0"))
+        with self.assertRaises(WorkflowError):
+            render_deploy_workflow(manifest())
+        with self.assertRaises(WorkflowError):
+            render_deploy_workflow(manifest(), tooling_ref=REF, tooling_version="0.2.0")
 
     def test_the_ssh_identity_is_removed_even_when_the_deploy_fails(self):
         self.assertEqual(self.steps("deploy", self.deploy_jobs)[-1]["name"], "Deploy with Shiplord")
@@ -601,6 +616,18 @@ class CompositeActionTests(unittest.TestCase):
     def test_the_action_is_pinned_to_the_commit_whose_shiplord_the_workflow_installs(self):
         self.assertEqual(self.reference, f"QueryPlanner/shiplord/deploy@{REF}")
         self.assertIn(f"git+https://github.com/QueryPlanner/shiplord.git@{REF}", self.text)
+
+    def test_pypi_installs_use_a_separate_existing_action_pin(self):
+        text = render_deploy_workflow(manifest(), tooling_version="0.2.0")
+        reference = "QueryPlanner/shiplord/deploy@465a02fd0d76308546893d2cc37a94254e07c598"
+        self.assertIn(f"uses: {reference}", text)
+        self.assertIn('"shiplord==0.2.0"', text)
+        self.assertNotIn("@None", text)
+        self.assertNotIn("deploy@v0.2.0", text)
+        self.assertEqual(passed_inputs(text, reference), self.passed)
+        # A custom source repository only affects git installs, not the public PyPI package's action.
+        self.assertIn(f"uses: {reference}", render_deploy_workflow(
+            manifest(), tooling_version="0.2.0", tooling_repository="Example/fork"))
 
     def test_every_input_the_workflow_passes_is_declared_and_nothing_undeclared_is_passed(self):
         self.assertTrue(self.passed)

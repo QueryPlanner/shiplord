@@ -1259,7 +1259,7 @@ def _github_setup(manifest: dict, repository: Optional[str], *, json_output: boo
 @github_app.command("setup", rich_help_panel="Administration")
 def github_setup_command(repo: Optional[str] = typer.Option(None, "--repo", help="owner/repository"),
                          ci_host: Optional[str] = typer.Option(None, "--ci-host", help="Server name CI should use (default: the alias host)."),
-                         tooling_ref: Optional[str] = typer.Option(None, "--tooling-ref", help="Commit of Shiplord to pin in CI."),
+                         tooling_ref: Optional[str] = typer.Option(None, "--tooling-ref", help="Commit of Shiplord to pin in CI (default: the installed PyPI version)."),
                          platforms: str = typer.Option("linux/amd64", "--platforms"),
                          build_command: Optional[str] = typer.Option(None, "--build-command",
                                                                      help="Native only: the command CI runs to build the binary."),

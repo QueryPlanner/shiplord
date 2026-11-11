@@ -542,9 +542,16 @@ class SetupTests(GitHubTestCase):
             self.assertEqual((caught.exception.code, caught.exception.step), (2, "workflow"))
             self.assertEqual((self.project / WORKFLOW_PATH).read_text(), before)
 
-    def test_the_tooling_version_must_be_pinned_explicitly_when_it_cannot_be_detected(self):
-        with patch("shiplord.github.detect_tooling_ref", return_value=None), self.assertRaisesRegex(GitHubError, "--tooling-ref"):
-            self.setup_call(tooling_ref=None)
+    def test_the_installed_version_is_the_default_pin_when_no_checkout_is_detected(self):
+        from shiplord import __version__
+
+        with patch("shiplord.github.detect_tooling_ref", return_value=None):
+            result = self.setup_call(tooling_ref=None)
+        self.assertIn(f"shiplord=={__version__}", (self.project / DEPLOY_WORKFLOW_PATH).read_text())
+        self.assertIn("uses: QueryPlanner/shiplord/deploy@465a02fd0d76308546893d2cc37a94254e07c598",
+                      (self.project / DEPLOY_WORKFLOW_PATH).read_text())
+        self.assertNotIn("@None", (self.project / DEPLOY_WORKFLOW_PATH).read_text())
+        self.assertIn(f"pinned at {__version__}", result["steps"]["workflow"])
         with patch("shiplord.github.detect_tooling_ref", return_value="ef" * 20):
             self.assertIn("efefefefefef", self.setup_call(tooling_ref=None)["steps"]["workflow"])
 

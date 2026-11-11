@@ -22,11 +22,15 @@ from . import __version__
 from .manifest import ManifestError, configured_branch, validate_binary_path, validate_build_command
 
 TOOLING_REPOSITORY = "QueryPlanner/shiplord"
+# PyPI releases can predate the composite action (notably 0.2.0). Pin its reviewed source
+# independently; git installs continue to use the same commit for both CLI and action.
+PYPI_DEPLOY_ACTION_REF = "465a02fd0d76308546893d2cc37a94254e07c598"
 WORKFLOW_PATH = ".github/workflows/shiplord-release.yml"
 DEPLOY_WORKFLOW_PATH = ".github/workflows/shiplord-deploy.yml"
 DEFAULT_QUALITY_WORKFLOW = ".github/workflows/code-quality.yml"
 GITHUB_API = "https://api.github.com"
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
+_VERSION = re.compile(r"[0-9]+(\.[0-9]+)*([._+-]?[0-9A-Za-z]+)*\Z")
 _PLATFORMS = re.compile(r"linux/(amd64|arm64)(,linux/(amd64|arm64))?\Z")
 # A native build runs on a hosted runner of the architecture the binary targets.
 _RUNNERS = {"linux/amd64": "ubuntu-24.04", "linux/arm64": "ubuntu-24.04-arm"}
@@ -113,19 +117,30 @@ def native_build_settings(manifest: dict) -> tuple[str, str]:
         raise WorkflowError(str(error)) from None
 
 
-def _validate(manifest: dict, tooling_ref: str, platforms: str, tooling_repository: str,
-              *, allow_native: bool = False) -> None:
+def _validate(manifest: dict, tooling_ref: str | None, tooling_version: str | None, platforms: str,
+              tooling_repository: str, *, allow_native: bool = False) -> None:
     runtime = manifest["runtime"]
     if runtime not in ("docker", "native"):
         raise WorkflowError("runtime must be docker or native")
     if runtime == "native" and not allow_native:
         raise WorkflowError("workflow generation is available for Docker applications; for a native binary, call "
                             "`shiplord deploy --binary` from your own build job")
-    if not _COMMIT.fullmatch(tooling_ref):
+    if (tooling_ref is None) == (tooling_version is None):
+        raise WorkflowError("pin Shiplord by exactly one of a commit or a PyPI version")
+    if tooling_ref is not None and not _COMMIT.fullmatch(tooling_ref):
         raise WorkflowError("the tooling reference must be a full 40-character commit SHA")
+    if tooling_version is not None and not _VERSION.fullmatch(tooling_version):
+        raise WorkflowError("the tooling version must be a PyPI version such as 0.2.0")
     validate_platforms(runtime, platforms)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", tooling_repository):
         raise WorkflowError("invalid tooling repository")
+
+
+def _tooling_install(tooling_ref: str | None, tooling_version: str | None, tooling_repository: str) -> str:
+    """The pip requirement the deploy job installs: a PyPI release, or a commit of the tooling repository."""
+    if tooling_version is not None:
+        return f"shiplord=={tooling_version}"
+    return f"git+https://github.com/{tooling_repository}.git@{tooling_ref}"
 
 
 
@@ -134,17 +149,21 @@ def _header() -> str:
             "review changes in a pull request.\n")
 
 
-def render_deploy_workflow(manifest: dict, *, tooling_ref: str, tooling_repository: str = TOOLING_REPOSITORY,
+def render_deploy_workflow(manifest: dict, *, tooling_ref: str | None = None, tooling_version: str | None = None,
+                           tooling_repository: str = TOOLING_REPOSITORY,
                            platforms: str = "linux/amd64") -> str:
     """Return the reusable deploy workflow. Deterministic: the same inputs always produce the same bytes."""
-    _validate(manifest, tooling_ref, platforms, tooling_repository)
+    _validate(manifest, tooling_ref, tooling_version, platforms, tooling_repository)
     branch = configured_branch(manifest)
     branch_ref = ("refs/heads/" + branch).replace("'", "''")
     quote = json.dumps
+    install = _tooling_install(tooling_ref, tooling_version, tooling_repository)
     qemu = f"      - uses: {ACTIONS['qemu']}\n" if "arm64" in platforms else ""
     # The deploy job's tailnet, SSH, deploy and summary steps live in this repository's composite action,
-    # pinned to the same commit as the Shiplord this workflow installs.
-    action = f"{tooling_repository}/deploy@{tooling_ref} # v1"
+    # pinned to the CLI commit for git installs, or an independent reviewed commit for PyPI installs.
+    action_repository = TOOLING_REPOSITORY if tooling_version is not None else tooling_repository
+    action_ref = PYPI_DEPLOY_ACTION_REF if tooling_version is not None else tooling_ref
+    action = f"{action_repository}/deploy@{action_ref}"
     return _header() + f"""name: Shiplord deploy
 
 on:
@@ -223,7 +242,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install the pinned Shiplord
-        run: python -m pip install --disable-pip-version-check {quote(f"git+https://github.com/{tooling_repository}.git@{tooling_ref}")}
+        run: python -m pip install --disable-pip-version-check {quote(install)}
       - name: Deploy with Shiplord
         uses: {action}
         with:
@@ -298,7 +317,7 @@ def _native_deploy_step(path: str) -> str:
 """
 
 
-def _native_deploy_job(branch_ref: str, tooling_repository: str, tooling_ref: str, path: str) -> str:
+def _native_deploy_job(branch_ref: str, install: str, path: str) -> str:
     quote = json.dumps
     return f"""  deploy:
     needs: build
@@ -320,7 +339,7 @@ def _native_deploy_job(branch_ref: str, tooling_repository: str, tooling_ref: st
         with:
           python-version: "3.12"
       - name: Install the pinned Shiplord
-        run: python -m pip install --disable-pip-version-check {quote(f"git+https://github.com/{tooling_repository}.git@{tooling_ref}")}
+        run: python -m pip install --disable-pip-version-check {quote(install)}
       - name: Join the tailnet
         uses: {ACTIONS['tailscale']}
         with:
@@ -369,9 +388,11 @@ def _native_deploy_job(branch_ref: str, tooling_repository: str, tooling_ref: st
 """
 
 
-def _native_workflow(manifest: dict, *, tooling_ref: str, tooling_repository: str, platforms: str) -> str:
+def _native_workflow(manifest: dict, *, tooling_ref: str | None, tooling_version: str | None,
+                     tooling_repository: str, platforms: str) -> str:
     """One file for a native application: the build job and the deploy job run in the same workflow."""
     command, path = native_build_settings(manifest)
+    install = _tooling_install(tooling_ref, tooling_version, tooling_repository)
     branch = configured_branch(manifest)
     app = manifest["name"]
     quote = json.dumps
@@ -398,10 +419,11 @@ concurrency:
 
 jobs:
 {_native_build_job(command, path, _RUNNERS[platforms])}
-{_native_deploy_job(branch_ref, tooling_repository, tooling_ref, path)}"""
+{_native_deploy_job(branch_ref, install, path)}"""
 
 
-def render_workflow(manifest: dict, *, tooling_ref: str, tooling_repository: str = TOOLING_REPOSITORY,
+def render_workflow(manifest: dict, *, tooling_ref: str | None = None, tooling_version: str | None = None,
+                    tooling_repository: str = TOOLING_REPOSITORY,
                     platforms: str = "linux/amd64", quality_workflow: str | None = None) -> str:
     """Return the trigger workflow text. Deterministic: the same inputs always produce the same bytes.
 
@@ -409,12 +431,12 @@ def render_workflow(manifest: dict, *, tooling_ref: str, tooling_repository: str
     pipeline with no quality job. It is never guessed here: the caller decides from the project. A native
     application gets one self-contained file and has no quality job.
     """
-    _validate(manifest, tooling_ref, platforms, tooling_repository, allow_native=True)
+    _validate(manifest, tooling_ref, tooling_version, platforms, tooling_repository, allow_native=True)
     if manifest["runtime"] == "native":
         if quality_workflow is not None:
             raise WorkflowError("a native workflow has no quality job; run your checks in the build command")
-        return _native_workflow(manifest, tooling_ref=tooling_ref, tooling_repository=tooling_repository,
-                                platforms=platforms)
+        return _native_workflow(manifest, tooling_ref=tooling_ref, tooling_version=tooling_version,
+                                tooling_repository=tooling_repository, platforms=platforms)
     quality = None if quality_workflow is None else validate_quality_workflow(quality_workflow)
     branch = configured_branch(manifest)
     app = manifest["name"]

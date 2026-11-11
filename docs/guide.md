@@ -47,9 +47,15 @@ verified: the plan's controlled install on *your* production server (§12E). See
 Install the CLI on the machine you work from:
 
 ```sh
-python -m pip install .
+python -m pip install shiplord
 shiplord --help
 ```
+
+The generated workflow pins the installed version (`shiplord==<version>`). From a git checkout, pass
+`--tooling-ref <commit>` to pin that commit instead.
+For a PyPI install, the composite deploy action is pinned separately to commit `465a02fd0d76308546893d2cc37a94254e07c598` in `QueryPlanner/shiplord`, which contains
+`deploy/action.yml`; it is not inferred from a PyPI version tag (the `v0.2.0` tag predates the action).
+With `--tooling-ref`, both the installed CLI and the action use that commit in the tooling repository.
 
 ## How it fits together
 

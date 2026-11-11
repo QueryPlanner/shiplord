@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
+from . import __version__
 from . import tailscale
 from .client import AdminClient, ClientError, HelperClient, run_ssh
 from .keys import KeyError_, parse_public_key
@@ -547,20 +548,24 @@ def _write_workflow(manifest: dict, repository: str, project: Path, state: dict,
                     quality_workflow: str | None = None, include_quality: bool = True,
                     build_command: str | None = None, binary_path: str | None = None) -> str:
     ref = tooling_ref or detect_tooling_ref()
+    version = None
     if ref is None:
-        raise GitHubError("cannot pin the Shiplord version for CI: pass --tooling-ref <commit sha> (a commit that is "
-                          "pushed to GitHub)", 2, "workflow")
+        # A PyPI install has no git checkout to pin, so pin the installed release instead.
+        version = __version__
+    pin = version if version is not None else ref[:12]
     merged = dict(manifest, github={"repository": repository, "deployment_branch": branch})
     try:
         if manifest["runtime"] == "native":
             # A native binary needs one file: the build job and the deploy job run in the same workflow.
             merged["github"] = {**merged["github"], "build_command": build_command, "binary_path": binary_path}
-            texts = {WORKFLOW_PATH: render_workflow(merged, tooling_ref=ref, platforms=platforms)}
+            texts = {WORKFLOW_PATH: render_workflow(merged, tooling_ref=ref, tooling_version=version,
+                                                    platforms=platforms)}
         else:
             quality = _resolve_quality_workflow(project, quality_workflow, include_quality)
-            texts = {DEPLOY_WORKFLOW_PATH: render_deploy_workflow(merged, tooling_ref=ref, platforms=platforms),
-                     WORKFLOW_PATH: render_workflow(merged, tooling_ref=ref, platforms=platforms,
-                                                    quality_workflow=quality)}
+            texts = {DEPLOY_WORKFLOW_PATH: render_deploy_workflow(merged, tooling_ref=ref, tooling_version=version,
+                                                                  platforms=platforms),
+                     WORKFLOW_PATH: render_workflow(merged, tooling_ref=ref, tooling_version=version,
+                                                    platforms=platforms, quality_workflow=quality)}
     except WorkflowError as error:
         raise GitHubError(str(error), 2, "workflow") from None
     digests = {path: hashlib.sha256(text.encode()).hexdigest() for path, text in texts.items()}
@@ -589,7 +594,7 @@ def _write_workflow(manifest: dict, repository: str, project: Path, state: dict,
     _save_state(directory, state)
     if not changed:
         return f"unchanged ({', '.join(texts)})"
-    return f"written ({', '.join(changed)}, Shiplord pinned at {ref[:12]})"
+    return f"written ({', '.join(changed)}, Shiplord pinned at {pin})"
 
 
 _GITHUB_HEADER = re.compile(r"^[ \t]*\[github\][ \t]*(?:#.*)?$", re.MULTILINE)

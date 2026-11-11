@@ -17,10 +17,16 @@ You build the app on your computer or in CI. Shiplord deploys a ready Docker ima
 ## Install
 
 ```sh
-python -m pip install git+https://github.com/QueryPlanner/shiplord.git
+python -m pip install shiplord
 shiplord --version
 shiplord doctor --local
 ```
+
+`shiplord github setup` pins the same version in the generated workflow (`shiplord==<version>`). When you run
+Shiplord from a git checkout, pass `--tooling-ref <commit>` instead.
+For a PyPI install, the composite deploy action is pinned separately to commit `465a02fd0d76308546893d2cc37a94254e07c598` in `QueryPlanner/shiplord`, which contains
+`deploy/action.yml`; it is not inferred from a PyPI version tag (the `v0.2.0` tag predates the action).
+With `--tooling-ref`, both the installed CLI and the action use that commit in the tooling repository.
 
 ## Set up once
 
