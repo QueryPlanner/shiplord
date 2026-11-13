@@ -18,13 +18,13 @@ from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
 
-from shiplord import cli, output
+from shiplord import __version__, cli, output
 from shiplord.workflow import PINS
 
 IMAGE = "ghcr.io/example/orders@sha256:" + "a" * 64
 COMMIT = "b" * 40
 MANIFEST = {"name": "orders", "server": "production"}
-CLIENT = {"version": "0.2.0", "executable": "/opt/shiplord/bin/shiplord"}
+CLIENT = {"version": __version__, "executable": "/opt/shiplord/bin/shiplord"}
 
 INVENTORY = {"ok": True, "applications": [{
     "application": "orders", "domain": "orders.example.com", "runtime": "docker", "host_port": 23001,

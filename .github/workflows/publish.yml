@@ -39,6 +39,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -46,15 +47,36 @@ jobs:
       - name: Verify package version
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          PYTHONPATH: src
         run: |
           python3 - <<'PYCODE'
           import os
+          import re
+          import subprocess
           import tomllib
+
+          from shiplord import __version__
 
           with open("pyproject.toml", "rb") as file:
               version = tomllib.load(file)["project"]["version"]
           if os.environ["RELEASE_TAG"] != "v" + version:
               raise SystemExit("Release tag does not match the package version")
+          if version != __version__:
+              raise SystemExit("Package version does not match the CLI and helper version")
+
+          # These historical tags predate the composite action and can still be published manually.
+          if version not in {"0.1.0", "0.2.0"}:
+              from shiplord.workflow import PYPI_DEPLOY_ACTION_REF
+
+              if not re.fullmatch(r"[0-9a-f]{40}", PYPI_DEPLOY_ACTION_REF):
+                  raise SystemExit("The PyPI deploy action must be pinned to a full commit SHA")
+              subprocess.run(["git", "cat-file", "-e", "HEAD:deploy/action.yml"], check=True)
+              result = subprocess.run(
+                  ["git", "diff", "--quiet", PYPI_DEPLOY_ACTION_REF, "HEAD", "--", "deploy/"],
+                  check=False,
+              )
+              if result.returncode != 0:
+                  raise SystemExit("The PyPI deploy action pin must match the release's deploy directory")
           PYCODE
       - name: Build and check the distributions
         run: |
