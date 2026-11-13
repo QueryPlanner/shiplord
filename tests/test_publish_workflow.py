@@ -58,15 +58,66 @@ class PublishWorkflowTests(unittest.TestCase):
                     self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
 
     def test_package_version_must_match_release_tag(self):
-        script = self.step_script("Verify package version")
         with tempfile.TemporaryDirectory() as directory:
-            (Path(directory) / "pyproject.toml").write_text('[project]\nversion = "0.1.0"\n')
-            for tag, succeeds in (("v0.1.0", True), ("v0.2.0", False)):
-                with self.subTest(tag=tag):
-                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
-                                            cwd=directory, env=dict(os.environ, RELEASE_TAG=tag),
-                                            capture_output=True, text=True)
-                    self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
+            root = Path(directory)
+            package = root / "src" / "shiplord"
+            package.mkdir(parents=True)
+            (root / "pyproject.toml").write_text('[project]\nversion = "0.2.0"\n')
+            runtime_version = package / "__init__.py"
+            runtime_version.write_text('__version__ = "0.2.0"\n')
+            result = self.verify_release(root, "v0.2.0")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = self.verify_release(root, "v0.3.0")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Release tag does not match the package version", result.stderr)
+            runtime_version.write_text('__version__ = "0.1.0"\n')
+            result = self.verify_release(root, "v0.2.0")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Package version does not match the CLI and helper version", result.stderr)
+
+    def verify_release(self, root, tag):
+        script = self.step_script("Verify package version")
+        return subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], cwd=root,
+                              env=dict(os.environ, RELEASE_TAG=tag, PYTHONPATH="src", PYTHONDONTWRITEBYTECODE="1"),
+                              capture_output=True, text=True)
+
+    def test_release_requires_the_pinned_deploy_action_to_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.run(["git", "-c", "user.name=Release test",
+                                       "-c", "user.email=release@example.test", "-c", "commit.gpgsign=false",
+                                       *args], cwd=root, check=True, capture_output=True, text=True).stdout.strip()
+
+            git("init", "-q")
+            deploy = root / "deploy"
+            deploy.mkdir()
+            action = deploy / "action.yml"
+            action.write_text("name: Reviewed action\n")
+            git("add", "deploy")
+            git("commit", "-qm", "Pin the reviewed action")
+            pin = git("rev-parse", "HEAD")
+
+            package = root / "src" / "shiplord"
+            package.mkdir(parents=True)
+            (root / "pyproject.toml").write_text('[project]\nversion = "0.3.0"\n')
+            (package / "__init__.py").write_text('__version__ = "0.3.0"\n')
+            workflow = package / "workflow.py"
+            workflow.write_text(f"PYPI_DEPLOY_ACTION_REF = {pin!r}\n")
+            result = self.verify_release(root, "v0.3.0")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            action.write_text("name: Changed action\n")
+            git("commit", "-qam", "Change the action without updating the pin")
+            result = self.verify_release(root, "v0.3.0")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("The PyPI deploy action pin must match", result.stderr)
+
+            workflow.write_text('PYPI_DEPLOY_ACTION_REF = "main"\n')
+            result = self.verify_release(root, "v0.3.0")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("The PyPI deploy action must be pinned to a full commit SHA", result.stderr)
 
     def test_manual_dispatch_only_runs_from_main_and_checks_out_the_tag(self):
         build = self.job("build")

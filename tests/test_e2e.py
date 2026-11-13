@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 
 import test_deploy_integration as fixtures  # noqa: E402  (module import: its test class is not collected)
+from shiplord import __version__  # noqa: E402
 from shiplord.client import AdminClient, ClientError  # noqa: E402
 
 ENABLED = (os.environ.get("SHIPLORD_TEST_E2E") == "1" and os.path.exists("/.dockerenv") and os.geteuid() == 0
@@ -206,7 +207,7 @@ else: sys.exit("unsupported: " + " ".join(args))
         second = self.cli_json("server", "bootstrap", "production")
         self.assertFalse(any(second["changed"].values()), second)
         self.assertEqual(second["version"], first["version"])
-        self.assertEqual(self.cli_json("doctor", "--server", "production")["helper_version"], "0.2.0")
+        self.assertEqual(self.cli_json("doctor", "--server", "production")["helper_version"], __version__)
         self.assertEqual(list(Path("/tmp").glob("shiplord-install.*")), [])  # the upload was removed
 
     def test_02a_inventory_checks_reported_helper_version_over_ssh(self):
@@ -214,7 +215,7 @@ else: sys.exit("unsupported: " + " ".join(args))
         version_file = Path("/usr/local/lib/shiplord/current/shiplord/__init__.py")
         original = version_file.read_text()
         try:
-            version_file.write_text(original.replace('"0.2.0"', '"0.1.0"'))
+            version_file.write_text(original.replace(f'"{__version__}"', '"0.1.0"'))
             self.assertEqual(self.cli_json("doctor", "--server", "production")["helper_version"], "0.1.0")
             old = self.cli_json("apps", "production", check=4)
             self.assertEqual(old["error_code"], "helper_upgrade_required")

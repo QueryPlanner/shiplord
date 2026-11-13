@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 
 from typer.testing import CliRunner
 
-from shiplord import cli, tailscale
+from shiplord import __version__, cli, tailscale
 from shiplord.client import AdminClient, ClientError, HelperClient
 from shiplord.commands import CommandError, image_repository_for
 from shiplord.configure import ConfigurationError, create_manifest
@@ -850,7 +850,7 @@ class CLITests(unittest.TestCase):
             version = self.invoke(directory, "--version")
             help_result = self.invoke(directory, "--help")
         self.assertEqual(version.returncode, 0)
-        self.assertEqual(version.stdout.strip(), "shiplord 0.2.0")
+        self.assertEqual(version.stdout.strip(), f"shiplord {__version__}")
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("shiplord", help_result.stdout.lower())
 
@@ -974,7 +974,7 @@ class CLIInventoryTests(ServerConfigMixin):
         self.assertEqual((gamma["reachable"], gamma["helper_version"], gamma["inventory_support"]),
                          (True, "0.1.0", "unsupported"))
         self.assertEqual(gamma["upgrade_command"], "shiplord server bootstrap gamma")
-        self.assertEqual(data["client"]["version"], "0.2.0")
+        self.assertEqual(data["client"]["version"], __version__)
 
     def test_doctor_all_servers_human_output_hints_only_the_confirmed_old_helper(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1611,7 +1611,7 @@ class CLIInventoryTests(ServerConfigMixin):
     def test_doctor_reports_client_path_and_helper_version(self):
         local = CliRunner().invoke(cli.app, ["doctor", "--local", "--json"])
         local_data = json.loads(local.stdout)
-        self.assertEqual(local_data["client"]["version"], "0.2.0")
+        self.assertEqual(local_data["client"]["version"], __version__)
         self.assertTrue(local_data["client"]["executable"])
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp) / "config"
@@ -1620,7 +1620,7 @@ class CLIInventoryTests(ServerConfigMixin):
                 server = CliRunner().invoke(cli.app, ["doctor", "--server", "hetzner-vm", "--json"], env=self.env(config))
         server_data = json.loads(server.stdout)
         self.assertEqual(server_data["helper_version"], "0.2.0")
-        self.assertEqual(server_data["client"]["version"], "0.2.0")
+        self.assertEqual(server_data["client"]["version"], __version__)
 
 
 class ServerUninstallTests(ServerConfigMixin):
